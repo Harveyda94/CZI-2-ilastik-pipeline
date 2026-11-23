@@ -314,3 +314,69 @@ def test_composite_is_bit_exact_with_a_non_dyadic_ramp(cfg):
     full = comp.tile(0, 0, 0, r[0], r[1], r[2], r[3], 0)
     covered = covered_mask(comp, full.shape)
     assert np.array_equal(full[covered], truth_window(gt, r)[covered])
+
+
+# ---------------------------------------------------------------- shared tile cache
+class _SlowCountingAics:
+    """Serves mosaic tiles slowly, counting decodes: slow enough that every thread asking
+    for a tile arrives while the first is still decoding it."""
+
+    def __init__(self, inner, fail_first=0):
+        import threading
+        self.inner, self.counts, self.fail_first = inner, {}, fail_first
+        self.lock = threading.Lock()
+
+    def get_dims_shape(self):
+        return self.inner.get_dims_shape()
+
+    def read_image(self, **kw):
+        import time
+        with self.lock:
+            self.counts[kw["M"]] = self.counts.get(kw["M"], 0) + 1
+            fail = self.fail_first > 0
+            self.fail_first -= 1
+        time.sleep(0.05)
+        if fail:
+            raise OSError("simulated read error")
+        return self.inner.read_image(**kw)
+
+
+def _in_threads(n, fn):
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(n) as ex:
+        futures = [ex.submit(fn) for _ in range(n)]
+    return futures
+
+
+def test_concurrent_requests_decode_each_mosaic_tile_once(cfg):
+    """Output tiles are smaller than mosaic tiles, so the read threads start on tiles
+    that all need the same mosaic tile. Each used to decode its own copy and discard all
+    but one; now the first decodes and the rest wait for it."""
+    gt, tiles, meta = make_mosaic()
+    src = fake_source(cfg, tiles)
+    slow = _SlowCountingAics(src.aics())
+    src.aics = lambda: slow
+    comp = MosaicCompositor(src, cfg, None, meta, PERT)
+    r = comp.rect
+    want = MosaicCompositor(fake_source(cfg, tiles), cfg, None, meta, PERT).tile(
+        0, 0, 0, r[0], r[1], 64, 64, 0)
+
+    futures = _in_threads(8, lambda: comp.tile(0, 0, 0, r[0], r[1], 64, 64, 0))
+    assert all(np.array_equal(f.result(), want) for f in futures)
+    assert slow.counts == {0: 1}, f"decodes per mosaic tile: {slow.counts}"
+
+
+def test_a_failed_decode_reaches_every_waiter_and_is_retried_afterwards(cfg):
+    """Waiters must not hang on a decode that failed, and the failure must not be cached."""
+    gt, tiles, meta = make_mosaic()
+    src = fake_source(cfg, tiles)
+    slow = _SlowCountingAics(src.aics(), fail_first=1)
+    src.aics = lambda: slow
+    comp = MosaicCompositor(src, cfg, None, meta, PERT)
+    r = comp.rect
+
+    futures = _in_threads(4, lambda: comp.tile(0, 0, 0, r[0], r[1], 64, 64, 0))
+    assert all(isinstance(f.exception(), OSError) for f in futures)
+    assert slow.counts == {0: 1}
+    assert comp.tile(0, 0, 0, r[0], r[1], 64, 64, 0).shape == (64, 64)
+    assert slow.counts == {0: 2}

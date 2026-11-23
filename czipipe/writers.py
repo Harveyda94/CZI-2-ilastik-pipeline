@@ -15,6 +15,7 @@ import math
 import os
 import sys
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -164,10 +165,14 @@ def provenance(source, cfg, plan, out_path, elapsed, tiles):
 
 def write_sidecars(source, cfg, plan, out_path, elapsed, tiles):
     if cfg.write_sidecars:
-        base = cfg.out_dir / f"{cfg.stem}{plan.suffix}"
+        # Appended, never Path.with_suffix(): that treats everything after the last dot in
+        # the stem as a suffix, so "brain_0.5x_scene00" would become "brain_0.<sidecar>"
+        # and every scene (and every file sharing the prefix) would overwrite the same one.
+        base = f"{cfg.stem}{plan.suffix}"
         if source.raw_xml:
-            base.with_suffix(".czi_metadata.xml").write_text(source.raw_xml, encoding="utf-8")
-        base.with_suffix(".conversion.json").write_text(
+            (cfg.out_dir / f"{base}.czi_metadata.xml").write_text(source.raw_xml,
+                                                                  encoding="utf-8")
+        (cfg.out_dir / f"{base}.conversion.json").write_text(
             json.dumps(provenance(source, cfg, plan, out_path, elapsed, tiles), indent=2))
     if cfg.stitch_report and plan.stitch_log:
         (cfg.out_dir / f"{cfg.stem}{plan.suffix}.stitch.json").write_text(
@@ -205,6 +210,8 @@ def tiff_reuse_state(out_path, want_hash, want_payload):
     except ValueError:
         return "unknown", None
     if stored.get("fingerprint") != want_hash:
+        if _same_but_uncorrected(stored.get("config"), want_payload):
+            return "complete", UNAPPLIED_NOTE
         return "mismatch", _describe_diffs(stored.get("config"), want_payload)
     return "complete", None
 
@@ -223,6 +230,8 @@ def write_tiff(source, cfg, backend, tiler, plan, log=print, progress=None):
         if state == "complete":
             log(f"{plan.label}: {out_path.name} is already complete and was written with "
                 "these settings; skipping. Set overwrite=True to rebuild.")
+            if detail:
+                log(f"  [note] {detail}; reused as the uncorrected output it is.")
             return out_path
         if state == "mismatch":
             raise FileExistsError(
@@ -326,10 +335,43 @@ def h5_filters(cfg):
     return {}
 
 
+def h5_direct_packer(cfg, dset):
+    """tile -> the exact bytes HDF5 would store for its chunk, or None to leave it to HDF5.
+
+    HDF5 runs its filters inside the library, one chunk at a time, so gzip there uses a
+    single thread however many are reading. One tile is exactly one chunk (h5_chunks),
+    which lets the read threads do the shuffle and deflate themselves - zlib releases the
+    GIL - and hand the writer finished chunks to place with write_direct_chunk. The file
+    is no different: the same filters are declared and any HDF5 reader decodes it.
+
+    Only gzip is done this way; lzf has no encoder outside h5py. A chunk is always stored
+    whole, so a partial tile at the right or bottom edge goes in zero-padded, exactly as
+    HDF5 would pad it.
+    """
+    if not cfg.hdf5_parallel_compress or cfg.hdf5_compression != "gzip":
+        return None
+    if not hasattr(getattr(dset, "id", None), "write_direct_chunk"):
+        return None
+    dtype = np.dtype(dset.dtype)
+    if sys.byteorder != "little" or not dtype.isnative:
+        return None                       # chunk bytes must be in the file's byte order
+    ch, cw = dset.chunks[3], dset.chunks[4]
+    level, size = int(cfg.hdf5_level), dtype.itemsize
+    shuffle = bool(cfg.hdf5_shuffle) and size > 1      # HDF5 skips it for 1-byte types
+
+    def pack(tile):
+        a = np.ascontiguousarray(tile[:ch, :cw], dtype=dtype)
+        if shuffle:                       # byte 0 of every element, then byte 1, ...
+            a = np.ascontiguousarray(a.view(np.uint8).reshape(-1, size).T)
+        return zlib.compress(a, level)
+
+    return pack
+
+
 def _settings_payload(source, cfg, plan, shape):
     """The settings that determine an output's pixel values, common to both formats."""
     blended = plan.compositor is not None
-    return {
+    payload = {
         "source": str(cfg.czi_path), "source_bytes": cfg.czi_path.stat().st_size,
         "axes": source.h5_axes,
         "shape": [int(v) for v in shape], "dtype": np.dtype(source.out_dtype).name,
@@ -349,10 +391,41 @@ def _settings_payload(source, cfg, plan, shape):
         "corrections": {str(k): [int(v[0]), int(v[1])]
                         for k, v in sorted((plan.corrections or {}).items())},
     }
+    if plan.flatfields and blended:
+        # Present only in this case, so every other fingerprint is unchanged and existing
+        # outputs keep being recognised. See _unapplied_flatfield for what it separates.
+        payload["flatfield_applied"] = "per mosaic tile"
+    return payload
 
 
 def _digest(payload):
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+UNAPPLIED_NOTE = ("it was written by an earlier version that estimated a flat-field for "
+                  "this mosaic but did not apply it, so its pixels are uncorrected")
+
+
+def _unapplied_flatfield(old):
+    """Was `old` recorded by a version that estimated a mosaic flat-field without applying it?
+
+    Until the profiles were handed to the compositor, a mosaic converted with
+    flatfield.mode set came out uncorrected while its record said otherwise. Such a
+    record names a flat-field on a blended (composited) output and lacks the
+    `flatfield_applied` marker that corrected output carries.
+    """
+    return (isinstance(old, dict) and "flatfield_applied" not in old
+            and old.get("flatfield_mode") not in (None, "none")
+            and old.get("blend") is not None)
+
+
+def _same_but_uncorrected(old, new):
+    """True if `old` is an unapplied-flat-field record of exactly the job `new` describes
+    with the flat-field off: the same pixels, so the file can stand in for it."""
+    if not _unapplied_flatfield(old) or new.get("flatfield_mode") != "none":
+        return False
+    as_written = dict(old, flatfield_mode="none", flatfield_dark=None, flatfield_digest={})
+    return as_written == json.loads(json.dumps(new))
 
 
 def _describe_diffs(old, new):
@@ -363,6 +436,9 @@ def _describe_diffs(old, new):
     keys = set(old) | set(new)
     diffs = [f"{k}: was {old.get(k)!r}, now {new.get(k)!r}"
              for k in sorted(keys) if old.get(k) != new.get(k)]
+    if _unapplied_flatfield(old):
+        diffs.append(f"note: {UNAPPLIED_NOTE}. Set flatfield.mode = \"none\" to keep "
+                     "using it as it is, or overwrite=True to rebuild it corrected")
     return diffs or ["(the stored fingerprint predates this version)"]
 
 
@@ -395,7 +471,9 @@ def h5_resume_state(h5py, out_path, want_hash, want_payload):
         return "unreadable", 0, f"{type(exc).__name__}: {exc}"
 
     if str(got) != want_hash:
-        return "mismatch", done, _describe_diffs(old, want_payload)
+        if not _same_but_uncorrected(old, want_payload):
+            return "mismatch", done, _describe_diffs(old, want_payload)
+        return ("complete" if complete else "resume"), done, UNAPPLIED_NOTE
     return ("complete" if complete else "resume"), done, None
 
 
@@ -409,6 +487,10 @@ def write_hdf5(source, cfg, backend, tiler, plan, log=print, progress=None):
     fp_hash, fp_payload = h5_fingerprint(source, cfg, plan, shape)
     state, done, detail = h5_resume_state(h5py, out_path, fp_hash, fp_payload)
 
+    if state in ("complete", "resume") and detail and not cfg.overwrite:
+        log(f"{plan.label}: [note] {out_path.name}: {detail}; "
+            + ("reused" if state == "complete" else "continued")
+            + " as the uncorrected output it is.")
     if state == "complete" and not cfg.overwrite:
         log(f"{plan.label}: {out_path.name} is already complete ({total} tiles); skipping. "
             "Set overwrite=True to rebuild.")
@@ -471,14 +553,24 @@ def write_hdf5(source, cfg, backend, tiler, plan, log=print, progress=None):
                 f.flush()
 
             work = make_worker(source, cfg, backend, tiler, plan, 0)
+            pack = h5_direct_packer(cfg, dset)
+            if pack is not None:
+                read, tail = work, (0,) * (len(shape) - 5)
+                work = lambda task: pack(read(task))      # compressed in the read thread
+                log(f"  gzip-{cfg.hdf5_level} compressed in the {cfg.n_read_threads} read "
+                    "threads (hdf5_parallel_compress)")
             dests = itertools.islice(tiler.tasks(plan.rect, 0), done, None)
             srcs = itertools.islice(tiler.tasks(plan.rect, 0), done, None)
 
             for task, tile in zip(dests, stream(srcs, work, ex, cfg.prefetch, bar)):
                 _t, _z, _c, x, y, w, h = task
                 yi, xi = y - plan.rect[1], x - plan.rect[0]
-                dset[(ti_of[_t], zi_of[_z], ci_of[_c],
-                      slice(yi, yi + h), slice(xi, xi + w))] = tile[:h, :w]
+                if pack is not None:
+                    dset.id.write_direct_chunk(
+                        (ti_of[_t], zi_of[_z], ci_of[_c], yi, xi) + tail, tile)
+                else:
+                    dset[(ti_of[_t], zi_of[_z], ci_of[_c],
+                          slice(yi, yi + h), slice(xi, xi + w))] = tile[:h, :w]
                 n_done += 1
                 if n_done % cfg.hdf5_checkpoint_every == 0:
                     # Data first, then the claim that it is there. A crash between the two

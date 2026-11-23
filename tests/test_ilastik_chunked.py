@@ -130,6 +130,28 @@ def test_without_a_halo_the_chunk_seams_show(run):
     assert len(differs) >= 4
 
 
+def test_every_timepoint_is_classified(real_h5py, cfg, tmp_path, monkeypatch):
+    """Each chunk's input was once staged from timepoint 0 alone, so every later
+    timepoint was classified from zeros: a plausible label map, and no error."""
+    monkeypatch.setattr(ilastik, "check_no_spaces", lambda *p: None)
+    monkeypatch.setattr(ilastik, "run_command", FakeIlastik())
+    shape = (2,) + SHAPE[1:]
+    vol = np.random.default_rng(12).integers(0, 65535, shape, dtype=np.uint16)
+    raw = tmp_path / "raw_t.h5"
+    with h5py.File(raw, "w") as f:
+        f.create_dataset("data", data=vol).attrs["axistags"] = vigra_axistags("tzcyx")
+    ilp = tmp_path / "proj.ilp"
+    ilp.write_bytes(b"project")
+    cfg.ilastik.chunk_z = CHUNK
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    out = cfg.out_dir / "seg_t.h5"
+    ilastik.run_classify_chunked(cfg, "ilastik", ilp, raw, "/data", out, "tzcyx",
+                                 shape[:2] + (1,) + shape[3:], halo_z=1,
+                                 log=lambda *a: None)
+    data, _ = exported(out)
+    assert np.array_equal(data, classifier(vol))
+
+
 # ---------------------------------------------------------------- restart semantics
 def test_interrupted_run_resumes_at_the_next_unfinished_chunk(run):
     run.fake.fail_on = (3, KeyboardInterrupt())
@@ -144,6 +166,41 @@ def test_interrupted_run_resumes_at_the_next_unfinished_chunk(run):
     assert any("resuming at Z=10/23" in m for m in run.logs)
     data, _ = exported(run.out)
     assert np.array_equal(data, classifier(run.vol))
+
+
+def test_chunk_size_can_change_between_runs_without_redoing_planes(run, cfg):
+    """The halo makes small chunks expensive, and the log says so; acting on that mid-way
+    must not cost the planes already exported. Resuming used to snap back to a multiple
+    of the new chunk_z, which here would have gone back to plane 7 and taken three runs."""
+    run.fake.fail_on = (3, KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        run()
+    cfg.ilastik.chunk_z = 7
+    run.fake.fail_on, run.fake.calls = None, 0
+    assert run() is True
+    assert run.fake.calls == 2                           # 10:17 and 17:23, nothing redone
+    data, prog = exported(run.out)
+    assert np.array_equal(data, classifier(run.vol))
+    assert prog["complete"] and prog["z_done"] == SHAPE[1]
+
+
+def test_halo_cost_is_counted_and_reported(run):
+    # The field run this came from: 440 planes, max sigma 10 -> a 35-plane halo.
+    assert ilastik.planes_computed(0, 440, 50, 35) == 1000
+    assert ilastik.planes_computed(0, 440, 200, 35) == 580
+    assert ilastik.planes_computed(100, 440, 50, 35) == 795      # resuming at Z=100
+    assert ilastik.planes_computed(0, 440, 50, 0) == 440
+
+    run()
+    line = [m for m in run.logs if "halo cost" in m]
+    assert len(line) == 1
+    assert "31 planes classified to export 23 (1.3x) at chunk_z=5" in line[0]
+    assert "chunk_z=10 -> 1.2x" in line[0] and "chunk_z=20 -> 1.1x" in line[0]
+
+
+def test_no_halo_cost_line_without_a_halo(run):
+    run(halo_z=0)
+    assert not any("halo cost" in m for m in run.logs)
 
 
 def test_finished_export_is_not_rerun(run):

@@ -100,7 +100,10 @@ p.preview_segmentation(seg)   # raw channels beside the labels at a few depths
 
 Every stage can be interrupted and re-run; nothing that finished is redone.
 
-- **Convert.** HDF5 resumes from its last checkpoint. TIFF is sequential, so an
+- **Convert.** HDF5 resumes from its last checkpoint, and gzip runs in the read threads
+  rather than on HDF5's single thread (about 7x faster to write in a synthetic benchmark;
+  the file is the same, and `cfg.hdf5_parallel_compress = False` restores the old path).
+  TIFF is sequential, so an
   interrupted TIFF starts again — it is written as `<name>.partial` and only renamed when
   complete, so a half-written file never carries the final name. Either format records
   the settings it was made with, and a finished output is reused only if they match;
@@ -114,7 +117,12 @@ Every stage can be interrupted and re-run; nothing that finished is redone.
   ilastik on 50 planes at a time, each with a Z-halo sized from the project's largest
   feature sigma so there are no seams, and checkpoints after every chunk. An interruption
   then loses one chunk, and re-running continues from the next. A partial export started
-  with different settings is refused with the setting that changed.
+  with different settings is refused with the setting that changed. The halo is not free:
+  a 35-plane halo makes each 50-plane chunk classify 120 planes, so the log prints the
+  cost at the current `chunk_z` and at larger ones. `chunk_z` can be changed between runs
+  of a partial export; finished planes are kept.
+- **ilastik's RAM cap** (`cfg.ilastik.ram_mb`) defaults to half the installed RAM. Set a
+  number of MB to choose it yourself.
 - While ilastik runs, a line every 5 minutes reports elapsed time and the CPU used by its
   whole process tree, and warns when that stops rising (needs `psutil`).
 - **After a kernel restart**, run `inspect()`, `plan()` and `convert()` again before
@@ -146,14 +154,15 @@ Every stage can be interrupted and re-run; nothing that finished is redone.
 ## Tests
 
 ```bash
-python -m pytest                  # 139 tests
+python -m pytest                  # 165 tests
 python tools/minipytest.py        # if pytest is unavailable
 ```
 
 The suite runs against synthetic data with known-correct output and fakes for
 pylibCZIrw, aicspylibczi and h5py, so it needs none of the microscopy stack (the
-chunked-ilastik tests use the real h5py, because the chunk record lives in HDF5
-attributes, and are skipped without it). It covers
+chunked-ilastik and parallel-compression tests use the real h5py, because the chunk
+record lives in HDF5 attributes and only the real library can decode a directly written
+chunk, and are skipped without it). It covers
 tile ordering and padding, TIFF and HDF5 round-trips being bit-exact, crash/resume
 semantics, registration recovering known offsets, and the guards: an inverted
 phase-correlation sign, a featureless tile, a rotated BigStitcher view, a multi-angle
@@ -206,6 +215,24 @@ From a 136 GB light-sheet file classified with ilastik 1.4.1rc2 on Windows:
   its own small input instead.
 - **ilastik can log a fatal error and still exit 0.** Each chunk's export is checked for
   the expected shape before it is accepted, and the error points at that chunk's log.
+
+Found by review rather than in the field:
+
+- **Flat-field correction was never applied to mosaics.** The profile was estimated,
+  reported and written into `conversion.json`, but not handed to the compositor, so the
+  pixels came out uncorrected. It is applied now. **A mosaic converted with
+  `flatfield.mode` set by an earlier version is uncorrected**, and is no longer mistaken
+  for a corrected one: re-running with the same settings refuses it and says why. Set
+  `flatfield.mode = "none"` to keep using that file as the uncorrected output it is (it
+  is not modified, so a chunked classification already under way on it continues), or
+  `overwrite = True` to rebuild it corrected. A classifier trained on the uncorrected
+  pixels should be checked against the corrected ones.
+- **Sidecar names lost everything after the first dot in the file name**, so
+  `brain_0.5x_scene00` wrote `brain_0.conversion.json` and every scene overwrote it.
+- **Chunked classification staged only timepoint 0**, so later timepoints were classified
+  from zeros.
+- **`verify()` reported success with no output attached** (after a kernel restart). It now
+  says to run `convert()` first, as `classify()` does.
 
 ## Known limitations
 

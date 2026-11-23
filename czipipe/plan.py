@@ -239,6 +239,11 @@ def plan_scenes(source, cfg, backend, log=print, progress=None):
                 plan.rect = plan.compositor.rect
 
         plan.flatfields = build_flatfields(source, cfg, plan, log=log, progress=progress)
+        if plan.compositor is not None:
+            # The estimate needs the compositor (it samples raw mosaic tiles), so the
+            # compositor exists first and is handed the profiles here. Without this the
+            # correction is estimated, reported and recorded, and never applied.
+            plan.compositor.flatfields = plan.flatfields
         plan.ranges = compute_ranges(source, cfg, scene_id, plan.rect, progress=progress)
         if plan.flatfields and cfg.output_bit_depth == 8:
             log("  [note] 8-bit ranges are measured from libCZI's uncorrected composite. "

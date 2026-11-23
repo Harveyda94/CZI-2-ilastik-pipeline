@@ -132,6 +132,13 @@ class Pipeline:
         return self.results
 
     def verify(self, n=None):
+        if not self.results:
+            # Typically a restarted kernel. all([]) is True, so carrying on would announce
+            # VERIFICATION PASSED having checked nothing.
+            raise RuntimeError(
+                "No converted output is attached to this Pipeline, so there is nothing to "
+                "verify. Run convert() first: outputs that are already complete are "
+                "recognised and skipped, so after a restart it only re-attaches them.")
         for r in self.results:
             r.verified = verify_output(self.source, self.cfg, self.backend, self.tiler,
                                        r.plan, r.path, n=n, log=self.log,

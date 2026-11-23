@@ -240,3 +240,99 @@ def test_broken_files_fail_ilastik_check(cfg, h5, mutate, expect):
 def test_paths_with_spaces_are_rejected():
     with pytest.raises(ValueError, match="spaces"):
         validate.check_no_spaces("/tmp/my data/scan.h5")
+
+
+# ---------------------------------------------------------------- parallel compression
+# Compressed chunks are built in the read threads and placed with write_direct_chunk,
+# which bypasses HDF5's own filters. Only the real library can say whether the bytes it
+# is handed are the bytes it would have written, so these use the real h5py.
+try:
+    import h5py as _real_h5py
+except ImportError:          # tools/minipytest.py has no importorskip, so skip per test
+    _real_h5py = None
+
+
+@pytest.fixture
+def real_h5():
+    if _real_h5py is None:
+        pytest.skip("h5py not installed")
+    return _real_h5py
+
+
+@pytest.fixture
+def packers(monkeypatch):
+    """Records what h5_direct_packer decided, so a test can tell which path ran."""
+    seen = []
+    real = writers.h5_direct_packer
+
+    def spy(cfg, dset):
+        seen.append(real(cfg, dset))
+        return seen[-1]
+
+    monkeypatch.setattr(writers, "h5_direct_packer", spy)
+    return seen
+
+
+def read_back(h5py, path):
+    with h5py.File(path, "r") as f:
+        d = f["/data"]
+        return d[()], dict(compression=d.compression, level=d.compression_opts,
+                           shuffle=d.shuffle, chunks=d.chunks)
+
+
+@pytest.mark.parametrize("bit_depth, shuffle", [(16, True), (16, False), (8, True)])
+def test_direct_chunks_read_back_exactly(cfg, real_h5, packers, bit_depth, shuffle):
+    """Includes the partial tiles on the right and bottom edges, which HDF5 stores as
+    full chunks, and 8-bit output, where the shuffle filter is a no-op."""
+    cfg.hdf5_shuffle = shuffle
+    src, tiler, plan, data = build(cfg, bit_depth)
+    path = write(cfg, src, tiler, plan)
+    assert packers[-1] is not None, "the parallel path was not taken"
+    got, how = read_back(real_h5, path)
+    assert how["compression"] == "gzip" and how["shuffle"] is shuffle
+    if bit_depth == 16:
+        assert np.array_equal(got, data)
+    assert validate.verify(src, cfg, Backend(False), tiler, plan, path,
+                           log=lambda *a: None) is True
+
+
+def test_direct_chunks_match_the_library_writing_them(cfg, real_h5, packers):
+    """Same data and the same declared filters either way: nothing downstream can tell."""
+    src, tiler, plan, data = build(cfg)
+    fast = read_back(real_h5, write(cfg, src, tiler, plan))
+    cfg.hdf5_parallel_compress, cfg.overwrite = False, True
+    slow = read_back(real_h5, write(cfg, src, tiler, plan))
+    assert packers[0] is not None and packers[1] is None
+    assert np.array_equal(fast[0], slow[0]) and np.array_equal(fast[0], data)
+    assert fast[1] == slow[1]
+
+
+def test_direct_chunks_resume_after_a_crash(cfg, real_h5, packers):
+    src, tiler, plan, data = build(cfg)
+    with pytest.raises(RuntimeError):
+        write(cfg, src, tiler, plan, crash_after=118)
+    path = write(cfg, src, tiler, plan)
+    assert packers[-1] is not None
+    assert np.array_equal(read_back(real_h5, path)[0], data)
+
+
+def test_direct_chunks_when_the_image_is_smaller_than_a_tile(cfg, real_h5, packers):
+    cfg.output_format, cfg.overwrite = "hdf5", False
+    rect = (3, 5, 40, 30)
+    data = np.random.default_rng(5).integers(0, 65535, (1, 2, 1, 30, 40), dtype=np.uint16)
+    src = FakeSource(data, rect, [0], [0, 1], [0], cfg)
+    tiler = Tiler(cfg.tile, [0], [0, 1], [0], 1)
+    path = write(cfg, src, tiler, ScenePlan(None, rect, {0: (0.0, 65535.0)}))
+    assert packers[-1] is not None
+    got, how = read_back(real_h5, path)
+    assert how["chunks"] == (1, 1, 1, 30, 40)
+    assert np.array_equal(got, data)
+
+
+@pytest.mark.parametrize("codec", ["lzf", None])
+def test_other_codecs_are_left_to_the_library(cfg, real_h5, packers, codec):
+    cfg.hdf5_compression = codec
+    src, tiler, plan, data = build(cfg)
+    path = write(cfg, src, tiler, plan)
+    assert packers[-1] is None
+    assert np.array_equal(read_back(real_h5, path)[0], data)

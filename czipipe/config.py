@@ -14,6 +14,19 @@ from typing import Optional, Sequence, Union
 PathLike = Union[str, Path]
 
 
+def physical_ram_mb() -> Optional[int]:
+    """Installed RAM in MB, or None if it cannot be read on this machine."""
+    try:
+        import psutil
+        return int(psutil.virtual_memory().total // 2**20)
+    except Exception:
+        pass
+    try:                                    # POSIX without psutil
+        return int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // 2**20)
+    except (AttributeError, ValueError, OSError):
+        return None
+
+
 @dataclass
 class RefineConfig:
     """Settings for `stitch_mode="refine"` (registration computed by this package)."""
@@ -65,7 +78,9 @@ class IlastikConfig:
     exe: Optional[PathLike] = None                     # None -> autodetect
     export_source: str = "Simple Segmentation"         # or "Probabilities"
     export_dtype: str = "uint8"
-    ram_mb: int = 4096                 # LAZYFLOW_TOTAL_RAM_MB; documented as approximate
+    ram_mb: Optional[int] = None       # LAZYFLOW_TOTAL_RAM_MB. None -> half the installed
+                                        # RAM: ilastik documents the cap as approximate and
+                                        # the OS still needs room to cache the input file.
     threads: Optional[int] = None      # None -> os.cpu_count()
     timeout_h: float = 48.0
     seg_compression: Optional[str] = "zlib"
@@ -138,6 +153,9 @@ class Config:
     hdf5_shuffle: bool = True
     hdf5_resume: bool = True
     hdf5_checkpoint_every: int = 200
+    hdf5_parallel_compress: bool = True         # gzip in the read threads instead of
+                                                # inside HDF5 (one thread). Same file;
+                                                # set False if a build misbehaves.
 
     # ---- extras -----------------------------------------------------------
     write_pyramid: bool = False
@@ -170,6 +188,15 @@ class Config:
     @property
     def ilastik_threads(self) -> int:
         return int(self.ilastik.threads or os.cpu_count() or 4)
+
+    @property
+    def ilastik_ram_mb(self) -> int:
+        """LAZYFLOW_TOTAL_RAM_MB: ilastik.ram_mb if set, otherwise half the installed RAM
+        (at least 2 GB), or 4 GB when the installed RAM cannot be read."""
+        if self.ilastik.ram_mb:
+            return int(self.ilastik.ram_mb)
+        total = physical_ram_mb()
+        return max(2048, total // 2) if total else 4096
 
     def validate(self) -> "Config":
         """Fail fast on settings that would otherwise blow up deep in a long run."""
@@ -210,6 +237,9 @@ class Config:
             raise ValueError("flatfield.min_gain must be in (0, 1]")
         if self.ilastik.run and not 1 <= len(self.ilastik.projects) <= 3:
             raise ValueError("ilastik.projects must hold between 1 and 3 projects")
+        if self.ilastik.ram_mb is not None and self.ilastik.ram_mb <= 0:
+            raise ValueError("ilastik.ram_mb must be a positive number of MB, or None to "
+                             f"size it from the installed RAM; got {self.ilastik.ram_mb!r}")
         if self.ilastik.chunk_z is not None and self.ilastik.chunk_z < 1:
             raise ValueError(f"ilastik.chunk_z must be a positive int, got {self.ilastik.chunk_z!r}")
         # Round-trip a probe through each TIFF codec that will be used, with the settings

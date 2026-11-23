@@ -43,6 +43,7 @@ from pathlib import Path
 import numpy as np
 import tifffile
 
+from . import config
 from .validate import check_no_spaces
 from .writers import (read_output_tile, h5_chunks, h5_filters, vigra_axistags, MICRON,
                       atomic_output, tiff_compressionargs, extra_tags)
@@ -277,12 +278,18 @@ def _kill_tree(proc, grace=5.0):
 
 def run_command(cfg, cmd, log_path, log=print, heartbeat_s=300):
     env = os.environ.copy()
-    env["LAZYFLOW_TOTAL_RAM_MB"] = str(int(cfg.ilastik.ram_mb))
+    env["LAZYFLOW_TOTAL_RAM_MB"] = str(cfg.ilastik_ram_mb)
     env["LAZYFLOW_THREADS"] = str(cfg.ilastik_threads)
     env.setdefault("PYTHONIOENCODING", "utf-8")     # so ilastik writes what we decode
     log(f"  LAZYFLOW_TOTAL_RAM_MB={env['LAZYFLOW_TOTAL_RAM_MB']}  "
         f"LAZYFLOW_THREADS={env['LAZYFLOW_THREADS']}"
         "   (ilastik documents this cap as approximate - leave headroom)")
+    if not cfg.ilastik.ram_mb:
+        total = config.physical_ram_mb()
+        log("  RAM cap chosen automatically: "
+            + (f"half of the {total / 1024:.0f} GB installed" if total else
+               "the installed RAM could not be read, so the 4 GB default")
+            + ". Set ilastik.ram_mb to choose it yourself.")
     log("  " + " \\\n    ".join(cmd))
     if cfg.ilastik.dry_run:
         log("  [dry run] not executed")
@@ -575,6 +582,34 @@ def _chunk_resume_state(h5py, out_h5, want_hash, want_payload):
     return ("complete" if complete else "resume"), z_done, None
 
 
+def planes_computed(z_from, Z, n, halo):
+    """Z-planes ilastik must read and classify to export [z_from, Z) in chunks of n:
+    each chunk's own planes plus up to `halo` either side of it."""
+    return sum(min(Z, z0 + n + halo) - max(0, z0 - halo) for z0 in range(z_from, Z, n))
+
+
+def halo_cost_report(z_from, Z, n, halo):
+    """One line on what the Z halo costs at this chunk_z, and what larger chunks would.
+
+    The halo is fixed by the project's largest feature sigma, so its share of the work
+    depends only on the chunk size: a 35-plane halo makes each 50-plane chunk classify
+    120 planes. That is easy to miss, because the run still finishes and is still right.
+    """
+    todo = Z - z_from
+    if not halo or todo <= 0:
+        return None
+    cost = planes_computed(z_from, Z, n, halo)
+    line = (f"  halo cost: {cost} planes classified to export {todo} "
+            f"({cost / todo:.1f}x) at chunk_z={n}")
+    if cost / todo >= 1.25 and n < todo:
+        bigger = sorted({min(m, todo) for m in (2 * n, 4 * n)})
+        line += (". Larger chunks cost less but lose more to a crash: "
+                 + ", ".join(f"chunk_z={m} -> {planes_computed(z_from, Z, m, halo) / todo:.1f}x"
+                             for m in bigger)
+                 + ". chunk_z may be changed between runs of a partial export.")
+    return line
+
+
 def run_classify_chunked(cfg, exe, ilp, raw_h5, internal, out_h5, axes, export_shape,
                          halo_z=0, log=print):
     """Classify in Z-chunks, checkpointed so a crash loses at most one chunk.
@@ -626,16 +661,24 @@ def run_classify_chunked(cfg, exe, ilp, raw_h5, internal, out_h5, axes, export_s
             prog.attrs["z_done"] = 0
             prog.attrs["complete"] = False
             prog.create_dataset("config", data=json.dumps(want_payload))
-    else:
-        log(f"[{out_h5.name}] resuming at Z={z_done}/{Z} ({z_done // n}/{n_chunks} "
+
+    # Continue from exactly where the record stops, not from a multiple of chunk_z, so
+    # the chunk size can be changed between runs without redoing exported planes. With
+    # an unchanged chunk_z the two are the same, and so is the numbering below.
+    todo = [(z0, min(z0 + n, Z)) for z0 in range(z_done, Z, n)]
+    start_chunk = math.ceil(z_done / n)
+    n_chunks = start_chunk + len(todo)
+    if state != "new":
+        log(f"[{out_h5.name}] resuming at Z={z_done}/{Z} ({start_chunk}/{n_chunks} "
            "chunks already done)")
+    cost = halo_cost_report(z_done, Z, n, halo_z)
+    if cost:
+        log(cost)
 
     chunk_in_h5 = out_h5.with_name(out_h5.stem + ".chunk_in.h5")
     chunk_out_h5 = out_h5.with_name(out_h5.stem + ".chunk_out.h5")
     t0 = time.perf_counter()
-    start_chunk = z_done // n
-    for i in range(start_chunk, n_chunks):
-        z0, z1 = i * n, min((i + 1) * n, Z)
+    for i, (z0, z1) in enumerate(todo, start_chunk):
         pad0, pad1 = max(0, z0 - halo_z), min(Z, z1 + halo_z)
         log(f"\n[{out_h5.name}] chunk {i + 1}/{n_chunks}  Z={z0}:{z1}  "
            f"(computing over {pad0}:{pad1} for halo context)")
@@ -658,7 +701,8 @@ def run_classify_chunked(cfg, exe, ilp, raw_h5, internal, out_h5, axes, export_s
                 tags = src.attrs.get("axistags")
                 dset.attrs["axistags"] = tags if tags is not None else vigra_axistags(axes)
                 for zi, z in enumerate(range(pad0, pad1)):   # one Z-plane at a time; never
-                    dset[0, zi] = src[0, z]                  # materialise more than that in RAM
+                    for t in range(T):                       # materialise more than that in
+                        dset[t, zi] = src[t, z]              # RAM. Every timepoint, not just 0.
                     if zi and zi % 50 == 0:
                         log(f"  staging input: plane {zi}/{pad1 - pad0} "
                            f"({time.perf_counter() - stage_t0:.0f}s elapsed)")

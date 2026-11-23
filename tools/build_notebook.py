@@ -186,10 +186,12 @@ cfg.ilastik.exe           = None   # None = autodetect; else run_ilastik.sh / il
                                    # e.g. r"C:\Program Files\ilastik-1.4.1\ilastik.exe"
 cfg.ilastik.projects      = []     # e.g. ["/path/to/project_a.ilp", ("tag_b", "/path/to/project_b.ilp")]
 cfg.ilastik.export_source = "Simple Segmentation"   # "Probabilities" is ~50x larger
-cfg.ilastik.ram_mb        = 4096
+cfg.ilastik.ram_mb        = None   # None = half the installed RAM; or a number of MB
 cfg.ilastik.dry_run       = True   # print the command first; verify before a long run
-cfg.ilastik.chunk_z       = None   # e.g. 50: classify 50 Z-planes per ilastik run, so an
-                                   # interruption loses one chunk, not the whole run
+cfg.ilastik.chunk_z       = None   # e.g. 150: classify 150 Z-planes per ilastik run, so an
+                                   # interruption loses one chunk, not the whole run. Each
+                                   # chunk also classifies a halo either side of it, so
+                                   # small chunks cost far more; the log prints the cost
 
 cfg.validate()
 ''')
@@ -306,8 +308,10 @@ Safe to interrupt; stopping the cell stops ilastik and every process it started.
 resumes per scene and project: finished segmentations are skipped, an ilastik export that
 completed before its TIFF conversion was interrupted is reused, and an interrupted ilastik
 run starts again (ilastik itself cannot resume). With `cfg.ilastik.chunk_z` set, it
-continues from the last finished Z-chunk instead. After a kernel restart, run Inspect, Plan
-and Convert first (Convert skips finished outputs), then this cell.
+continues from the last finished Z-chunk instead, and prints what the Z halo costs at that
+chunk size; `chunk_z` can be changed between runs without losing finished planes. After a
+kernel restart, run Inspect, Plan and Convert first (Convert skips finished outputs), then
+this cell.
 """)
 
 code(r'''

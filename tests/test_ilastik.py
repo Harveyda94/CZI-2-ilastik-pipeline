@@ -299,6 +299,55 @@ def test_nonzero_exit_is_reported(cfg, tmp_path):
         ilastik.run_command(cfg, cmd, tmp_path / "ilastik.log", log=lambda *a: None)
 
 
+def test_ram_cap_defaults_to_half_the_installed_ram(cfg, monkeypatch):
+    """A fixed 4 GB default starved ilastik on a workstation; it is sized from the machine
+    unless a number is given."""
+    from czipipe import config
+
+    monkeypatch.setattr(config, "physical_ram_mb", lambda: 65536)
+    assert cfg.ilastik.ram_mb is None
+    assert cfg.ilastik_ram_mb == 32768
+    monkeypatch.setattr(config, "physical_ram_mb", lambda: 3000)
+    assert cfg.ilastik_ram_mb == 2048                    # floor on a small machine
+    monkeypatch.setattr(config, "physical_ram_mb", lambda: None)
+    assert cfg.ilastik_ram_mb == 4096                    # cannot tell: the old default
+    cfg.ilastik.ram_mb = 8192
+    assert cfg.ilastik_ram_mb == 8192                    # an explicit setting always wins
+
+
+def test_installed_ram_is_readable_here():
+    from czipipe import config
+
+    assert config.physical_ram_mb() > 512
+
+
+def test_ram_cap_reaches_ilastik_and_the_log_says_where_it_came_from(cfg, tmp_path,
+                                                                     monkeypatch):
+    from czipipe import config
+
+    monkeypatch.setattr(config, "physical_ram_mb", lambda: 65536)
+    cmd = _script(tmp_path, """
+        import os
+        print("Exporting with", os.environ["LAZYFLOW_TOTAL_RAM_MB"], flush=True)
+    """)
+    msgs = []
+    assert ilastik.run_command(cfg, cmd, tmp_path / "ilastik.log", log=msgs.append) is True
+    assert any("Exporting with 32768" in m for m in msgs)
+    assert any("half of the 64 GB installed" in m for m in msgs)
+
+    cfg.ilastik.ram_mb = 8192
+    msgs.clear()
+    ilastik.run_command(cfg, cmd, tmp_path / "ilastik.log", log=msgs.append)
+    assert any("Exporting with 8192" in m for m in msgs)
+    assert not any("installed" in m for m in msgs)
+
+
+def test_ram_cap_must_be_positive(cfg):
+    cfg.ilastik.ram_mb = 0
+    with pytest.raises(ValueError, match="ram_mb"):
+        cfg.validate()
+
+
 # ---------------------------------------------------------------- locating ilastik
 def test_windows_install_is_found_and_newest_wins(cfg, tmp_path, monkeypatch):
     for v in ("1.4.1", "1.4.9", "1.4.10"):

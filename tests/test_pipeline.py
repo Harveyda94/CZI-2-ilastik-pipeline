@@ -352,3 +352,30 @@ def test_probe_disables_scene_arg_when_it_is_the_cause(cfg):
     src.probe_scene_arg = FakeSource.probe_scene_arg.__get__(src)
     assert src.probe_scene_arg([(0, RECT)], {"T": 0, "Z": 0, "C": 0}) is False
     assert src.scene_arg_ok is False
+
+
+def test_sidecars_keep_a_stem_that_contains_dots(cfg):
+    """Path.with_suffix() takes everything after the last dot to be the suffix, so
+    "brain_0.5x_tile_scene00" became "brain_0.conversion.json" - and every scene of the
+    file, and every other file sharing that prefix, overwrote the same sidecar."""
+    cfg.write_sidecars, cfg.out_stem = True, "brain_0.5x_tile"
+    src, tiler, plan, _ = build(cfg)
+    for scene in (0, 1):
+        plan.scene_id = scene
+        _write(cfg, src, tiler, plan)
+    names = {p.name for p in cfg.out_dir.iterdir()}
+    for scene in (0, 1):
+        assert f"brain_0.5x_tile_scene{scene:02d}.conversion.json" in names
+        assert f"brain_0.5x_tile_scene{scene:02d}.czi_metadata.xml" in names
+    assert "brain_0.conversion.json" not in names
+
+
+def test_verify_with_nothing_attached_is_an_error_not_a_pass(cfg):
+    """Typically a restarted kernel. all([]) is True, so this used to announce
+    VERIFICATION PASSED having checked nothing."""
+    from czipipe.pipeline import Pipeline
+
+    msgs = []
+    with pytest.raises(RuntimeError, match="nothing to verify"):
+        Pipeline(cfg, log=msgs.append).verify()
+    assert not any("PASSED" in str(m) for m in msgs)

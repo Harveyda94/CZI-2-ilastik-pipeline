@@ -323,3 +323,114 @@ def test_missing_aicspylibczi_is_reported_not_treated_as_single_field(cfg):
     src.aics = no_aics
     with pytest.raises(ImportError, match="pip install aicspylibczi"):
         plan_scenes(src, cfg, Backend(False), log=lambda *a: None)
+
+
+# ---------------------------------------------------------------- applied, not just estimated
+def _mosaic_job(cfg, corrected):
+    """A stitched-mosaic job with the flat-field on (and applied) or off."""
+    from czipipe.geometry import Tiler
+
+    prof, gt, tiles, rects, src = make_shaded_compositor(cfg)
+    fields = {0: ff.build(prof)} if corrected else {}
+    zero = {m: (0, 0) for m in rects}
+    comp = MosaicCompositor(src, cfg, None, rects, zero, flatfields=fields)
+    plan = ScenePlan(None, comp.rect, {}, corrections=zero, compositor=comp,
+                     flatfields=fields)
+    cfg.stitch_mode = "refine"
+    cfg.flatfield.mode = "measured" if corrected else "none"
+    return src, Tiler(cfg.tile, [0], [0], [0]), plan
+
+
+def test_plan_scenes_applies_the_flatfield_on_a_mosaic(cfg, monkeypatch):
+    """The profile used to be estimated, reported and written into the provenance record
+    without ever reaching the compositor, so a mosaic came out uncorrected. Every other
+    test here builds the compositor by hand, which is how that went unnoticed."""
+    from czipipe import plan as planmod
+    from czipipe.geometry import Tiler
+    from czipipe.worker import make_worker
+
+    prof, gt, tiles, rects, src = make_shaded_compositor(cfg)
+    monkeypatch.setattr(planmod, "mosaic_geometry",
+                        lambda source, scene_id, ref: (dict(rects), (0, 0)))
+    cfg.stitch_mode = "refine"
+    cfg.flatfield.n_samples, cfg.flatfield.save_profile = 9, False
+
+    def composite(mode):
+        cfg.flatfield.mode = mode
+        plan = planmod.plan_scenes(src, cfg, Backend(False), log=lambda *a: None)[0]
+        r = plan.rect
+        work = make_worker(src, cfg, Backend(False), Tiler((r[3], r[2]), [0], [0], [0]), plan)
+        return work((0, 0, 0, r[0], r[1], r[2], r[3])).astype(np.float32), r
+
+    plain, r = composite("none")
+    fixed, _ = composite("measured")
+    truth = gt[64:64 + r[3], 64:64 + r[2]].astype(np.float32)
+    err_plain = np.abs(plain - truth)[8:-8, 8:-8].mean() / truth.mean()
+    err_fixed = np.abs(fixed - truth)[8:-8, 8:-8].mean() / truth.mean()
+    assert err_fixed < err_plain / 2, f"uncorrected {err_plain:.4f}, corrected {err_fixed:.4f}"
+
+
+def test_fingerprint_marks_only_a_flatfield_applied_per_mosaic_tile(cfg):
+    """The marker is what separates a corrected mosaic from one written before the
+    correction was applied. It must appear nowhere else, or every existing output and
+    partial export would stop being recognised."""
+    from czipipe import writers
+
+    src, tiler, plan = _mosaic_job(cfg, corrected=True)
+    shape = tiler.level_shape(plan.rect, 0)
+    assert writers._settings_payload(src, cfg, plan, shape)["flatfield_applied"]
+
+    src, tiler, plan = _mosaic_job(cfg, corrected=False)
+    assert "flatfield_applied" not in writers._settings_payload(src, cfg, plan, shape)
+
+    cfg.flatfield.mode = "measured"                  # single field of view: no compositor
+    single = ScenePlan(None, plan.rect, {}, flatfields={0: ff.build(true_profile())})
+    assert "flatfield_applied" not in writers._settings_payload(src, cfg, single, shape)
+
+
+def _written_before_the_fix(cfg, monkeypatch, fmt):
+    """An output as the earlier version left it: flat-field recorded, pixels uncorrected."""
+    import sys
+
+    from czipipe import writers
+    from czipipe.pipeline import _null_progress
+    from conftest import FakeH5
+
+    monkeypatch.setitem(sys.modules, "h5py", FakeH5)
+    cfg.overwrite, cfg.output_format = False, fmt
+    real = writers._settings_payload
+
+    def old_payload(*a):
+        p = real(*a)
+        p.pop("flatfield_applied", None)
+        return p
+
+    def write(corrected, log=None, legacy=False):
+        src, tiler, plan = _mosaic_job(cfg, corrected)
+        if legacy:
+            plan.compositor.flatfields = {}
+        monkeypatch.setattr(writers, "_settings_payload", old_payload if legacy else real)
+        return writers.WRITERS[fmt](src, cfg, Backend(False), tiler, plan,
+                                    log=log or (lambda *a: None), progress=_null_progress)
+
+    return write, write(True, legacy=True)
+
+
+@pytest.mark.parametrize("fmt", ["tiff", "hdf5"])
+def test_output_from_before_the_fix_is_not_passed_off_as_corrected(cfg, monkeypatch, fmt):
+    write, path = _written_before_the_fix(cfg, monkeypatch, fmt)
+    with pytest.raises((FileExistsError, RuntimeError), match="uncorrected"):
+        write(True)
+
+
+@pytest.mark.parametrize("fmt", ["tiff", "hdf5"])
+def test_output_from_before_the_fix_is_reusable_with_the_flatfield_off(cfg, monkeypatch, fmt):
+    """It is, pixel for pixel, a flatfield.mode="none" output, and a long classification
+    may already hang off it - so it can be re-attached as that, and is not touched (the
+    chunked ilastik record is tied to its size and modification time)."""
+    write, path = _written_before_the_fix(cfg, monkeypatch, fmt)
+    before = path.stat().st_mtime_ns
+    msgs = []
+    assert write(False, log=msgs.append) == path
+    assert path.stat().st_mtime_ns == before
+    assert any("uncorrected" in m for m in msgs)

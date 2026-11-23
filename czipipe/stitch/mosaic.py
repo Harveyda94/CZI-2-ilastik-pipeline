@@ -7,6 +7,7 @@ The compositor is shared by `refine` and `bigstitcher`: both produce a
 from __future__ import annotations
 
 import threading
+from concurrent.futures import Future
 
 import numpy as np
 
@@ -93,6 +94,7 @@ class MosaicCompositor:
                      max(r[0] + r[2] for r in self.rects.values()) - min(xs),
                      max(r[1] + r[3] for r in self.rects.values()) - min(ys))
         self._cache = {}
+        self._loading = {}                 # key -> Future, for tiles being decoded now
         self._bytes = 0
         self._limit = int(cfg.mosaic_cache_mb * 1e6)
         self._lock = threading.Lock()
@@ -101,24 +103,46 @@ class MosaicCompositor:
 
     # -- tile access --------------------------------------------------------
     def _fetch(self, key):
+        """One mosaic tile, decoded at most once however many threads ask together.
+
+        Output tiles are smaller than mosaic tiles, so the read threads routinely start
+        on output tiles that all need the same mosaic tile. Without the in-flight record
+        each of them would miss the cache, decode its own copy and discard all but one.
+        The first to ask decodes; the rest wait for its result (or its exception, which
+        is not cached, so a later request tries again).
+        """
         t, z, c, m = key
         with self._lock:
             hit = self._cache.get(key)
             if hit is not None:
                 self._cache[key] = self._cache.pop(key)       # refresh LRU order
                 return hit
+            pending = self._loading.get(key)
+            mine = pending is None
+            if mine:
+                pending = self._loading[key] = Future()
+        if not mine:
+            return pending.result()
+
         kw = {"M": m, "T": t, "Z": z, "C": c}
         if self.scene_id is not None and self._has_S:
             kw["S"] = self.scene_id
-        arr = np.squeeze(self.source.aics().read_image(**kw)[0])
+        try:
+            arr = np.squeeze(self.source.aics().read_image(**kw)[0])
+        except BaseException as exc:
+            with self._lock:
+                self._loading.pop(key, None)
+            pending.set_exception(exc)
+            raise
         with self._lock:
-            if key not in self._cache:
-                self._cache[key] = arr
-                self._bytes += arr.nbytes
-                while self._bytes > self._limit and len(self._cache) > 1:
-                    old_key, old_arr = next(iter(self._cache.items()))
-                    self._cache.pop(old_key)
-                    self._bytes -= old_arr.nbytes
+            self._cache[key] = arr
+            self._bytes += arr.nbytes
+            while self._bytes > self._limit and len(self._cache) > 1:
+                old_key, old_arr = next(iter(self._cache.items()))
+                self._cache.pop(old_key)
+                self._bytes -= old_arr.nbytes
+            self._loading.pop(key, None)
+        pending.set_result(arr)
         return arr
 
     def _weight(self, shape):
