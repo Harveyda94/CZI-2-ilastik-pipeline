@@ -62,7 +62,11 @@ class FakeReader:
 
 
 class FakeAics:
-    """Stands in for aicspylibczi, serving whole mosaic tiles by index."""
+    """Stands in for aicspylibczi, serving whole mosaic tiles by index.
+
+    A tile is a (Y, X) array, the same at every plane, or a (Z, Y, X) stack indexed by
+    the Z asked for.
+    """
 
     def __init__(self, tiles, n_c=1, n_z=1, n_t=1, has_scene=False):
         self.tiles = tiles
@@ -77,7 +81,10 @@ class FakeAics:
         return [self.dims]
 
     def read_image(self, **kw):
-        return self.tiles[kw["M"]][None, None], None
+        tile = self.tiles[kw["M"]]
+        if tile.ndim == 3:
+            tile = tile[kw["Z"]]
+        return tile[None, None], None
 
 
 class FakeSource:

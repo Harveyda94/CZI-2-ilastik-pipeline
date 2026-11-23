@@ -159,7 +159,9 @@ cfg.manual_scaling = {}            # um/pixel, e.g. {"X": 0.65, "Y": 0.65, "Z": 
 
 # --- stitching detail (only read for the matching stitch_mode) --------------
 cfg.refine.channel   = None        # correlation channel; None -> first selected
-cfg.refine.z         = None        # correlation plane;   None -> middle of selection
+cfg.refine.planes    = 5           # Z planes to register on, spread through the stack
+                                   # (1 = the middle plane only, and no depth check)
+cfg.refine.z         = None        # or name them yourself: a Z index, or a list of them
 cfg.refine.min_ncc   = 0.20
 cfg.refine.max_shift = 100
 
@@ -220,10 +222,19 @@ rather than the illumination, and the profile should not be used &mdash; take mo
 supply a measured flat-field with `mode="file"`. The saved `.flatfield.tif` is worth
 opening: it should look like illumination, not like your specimen.
 
-If `stitch_mode` is `refine`, the two numbers that matter appear here: the fraction of
-pairs accepted (low means featureless overlaps at this Z — try `cfg.refine.z` or a
-brighter `cfg.refine.channel`) and the RMS residual (above ~2 px means the tiles are not
-related by pure translation, and no tuning here will fix that).
+If `stitch_mode` is `refine`, three things to read appear here:
+
+- **Pairs accepted.** Low means the overlaps are featureless at the planes that were
+  tried. The depth check lists how many pairs each plane was usable for, so you can see
+  which planes carried the registration; try a brighter `cfg.refine.channel`, or name
+  better planes with `cfg.refine.z`.
+- **RMS residual.** Above ~2 px means the tiles are not related by pure translation, and
+  no tuning here will fix that.
+- **The depth check.** Each overlap is measured at `cfg.refine.planes` Z planes and
+  combined into one XY shift per tile. A `[warn]` here means some pairs fit a different
+  shift at some depths: one shift per tile cannot be right at every plane, and the seams
+  will be offset by about the stated amount at the planes listed. It is a report, not a
+  correction, and it cannot see tiles that are offset from each other in Z.
 """)
 
 code(r'''
@@ -374,8 +385,10 @@ the CZI, so no resaved copy is needed. All three feed the same compositor.
 rotation, shear, or multi-angle/multi-illumination data. Those need BigStitcher's own
 fusion; fuse there and run this over the fused output with `metadata`.
 
-**Registration is computed once**, on one reference plane, and applied to every Z, C and
-T. Right for a stage-scanned mosaic, wrong if you have per-plane drift. Chromatic offsets
+**Registration is 2D.** `refine` measures each overlap at several Z planes, but combines
+them into a single XY shift per tile that is applied to every Z, C and T. Right for a
+stage-scanned mosaic. If the offset changes with depth the plan output says so, but does
+not correct it, and a Z offset between tiles is not measured at all. Chromatic offsets
 between channels are not corrected.
 
 **Flat-field correction is per field of view**, so it only works where individual fields

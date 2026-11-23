@@ -96,6 +96,49 @@ seg = p.classify()
 p.preview_segmentation(seg)   # raw channels beside the labels at a few depths
 ```
 
+## Registration with `stitch_mode="refine"`
+
+`refine` corrects the stage positions by a single integer XY shift per tile. It is 2D:
+the same shift is applied to every Z plane, channel and timepoint.
+
+Each overlapping pair of tiles is phase-correlated at several Z planes
+(`cfg.refine.planes`, default 5, taken at the centres of equal slabs of the Z selection;
+or name them with `cfg.refine.z`). A plane is *usable* for a pair if the shift it
+proposes matches well and beats the stage position. Every proposed shift is then scored
+at all of the pair's usable planes and the best overall is kept, so a pair needs only
+one plane with structure in the overlap, and a shift fitted to one plane's noise loses
+to one that fits the stack. The cost is one read of every mosaic tile per plane, plus a
+second read where planes disagreed; memory stays at one plane of tiles.
+
+`plan()` prints what happened, and the same record goes into `<name>.stitch.json`:
+
+```
+scene 0: 20/20 pairs accepted, RMS residual 0.00 px
+  max |correction| 9 px
+  depth check, Z 10, 30, 50, 70, 90:
+    Z 10: 20/20 accepted pairs usable
+    Z 30: 20/20 accepted pairs usable
+    Z 50: 20/20 accepted pairs usable
+    Z 70: 20/20 accepted pairs usable, 8 fit a different shift (up to 6 px away)
+    Z 90: 20/20 accepted pairs usable, 8 fit a different shift (up to 6 px away)
+  [warn] 8 pair(s) fit a different shift at some depths, by up to 6 px. One XY
+  correction per tile cannot fit every plane: expect seams offset by about that much at
+  the planes marked above.
+```
+
+- **usable** counts show which planes carried the registration. A plane at 0 had nothing
+  to correlate in the overlaps.
+- **fit a different shift** means that at that plane another shift, more than 1 px from
+  the one chosen, matches measurably better (by `refine.min_gain`). That is an offset
+  that changes with depth, which this mode reports and does not correct.
+- **undecided between shifts** means a plane proposed another shift but the chosen one
+  matches it about as well, as happens with structure running along a seam, or noise.
+  It is not counted as a difference.
+
+The depth check compares XY shifts between planes. It cannot see tiles that are offset
+from each other in Z; nothing in the pipeline measures that. `refine.planes = 1` is the
+old single-plane behaviour, with no depth check.
+
 ## Interrupting and restarting
 
 Every stage can be interrupted and re-run; nothing that finished is redone.
@@ -146,7 +189,7 @@ Every stage can be interrupted and re-run; nothing that finished is redone.
 | `validate.py` | output verification and the ilastik HDF5 check |
 | `ilastik.py` | headless classification and result conversion |
 | `stitch/mosaic.py` | tile geometry and the memory-bounded compositor |
-| `stitch/refine.py` | phase correlation and the global least-squares solve |
+| `stitch/refine.py` | multi-plane phase correlation, the global least-squares solve, the depth check |
 | `stitch/bigstitcher.py` | BDV XML transform import |
 | `pipeline.py` | `Pipeline`, the orchestration the notebook calls |
 | `bench.py` | stage timing |
@@ -154,7 +197,7 @@ Every stage can be interrupted and re-run; nothing that finished is redone.
 ## Tests
 
 ```bash
-python -m pytest                  # 165 tests
+python -m pytest                  # 190 tests
 python tools/minipytest.py        # if pytest is unavailable
 ```
 
@@ -167,6 +210,14 @@ tile ordering and padding, TIFF and HDF5 round-trips being bit-exact, crash/resu
 semantics, registration recovering known offsets, and the guards: an inverted
 phase-correlation sign, a featureless tile, a rotated BigStitcher view, a multi-angle
 dataset, a mismatched XML, changed settings on resume, and malformed HDF5.
+
+Multi-plane registration is checked on five-plane synthetic stacks: a featureless middle
+plane no longer loses the registration; a tile that sits 6 px elsewhere in the two
+deepest planes keeps the majority's shift and is reported at exactly those planes; a
+plane of stripes, which cannot fix one axis, is not reported; and noise alone is not
+reported either. Measured over 12 seeds, no pair is falsely flagged up to a noise sd of
+800, one pair in one seed at 2000, and about one pair in every third seed at 4000, by
+which point a single plane has lost a third of its pairs.
 
 Flat-field is checked against a known synthetic vignette: the estimator recovers it to
 under 0.05 worst-pixel, correction reduces residual shading error by more than 3x, and
@@ -241,8 +292,11 @@ Found by review rather than in the field:
   reroutes through the same compositor). Once libCZI has blended a mosaic the fields are
   gone. The `measured` estimator assumes sample content is uncorrelated with position
   within the field; the split-half diagnostic reports when it is not.
-- **Registration is computed once** on one reference plane and applied to all Z/C/T.
-  Wrong if you have per-plane drift. No chromatic correction.
+- **Registration is 2D.** `refine` measures several Z planes but applies one XY shift per
+  tile to all Z/C/T. An offset that changes with depth is reported by the depth check and
+  not corrected; with only two usable planes that disagree, the tile is left between the
+  two. A Z offset between tiles is not measured at all, in any mode. No chromatic
+  correction.
 - **`bigstitcher` mode is translation-only**, and refuses rotation, shear, multi-angle and
   multi-illumination rather than dropping them silently.
 - **TIFF cannot resume mid-file.** Sequential format; an interrupted TIFF starts again

@@ -164,10 +164,23 @@ def _collect_samples(source, cfg, plan, channel, field_shape, log):
 
 
 # ---------------------------------------------------------------- planning
+def registration_planes(source, cfg):
+    """Z planes `refine` registers on: refine.z if set, else refine.planes slab centres."""
+    zs = cfg.refine.z_planes()
+    return zs if zs is not None else refine.sample_planes(source.sel_z, cfg.refine.planes)
+
+
 def reference_plane(source, cfg):
+    """The single plane used for probing and tile geometry.
+
+    The middle of the Z selection unless refine.z names planes, in which case the middle
+    one of those. It does not depend on refine.planes, so it is the same plane as before
+    registration used more than one.
+    """
     rc = cfg.refine
+    zs = rc.z_planes()
     return {"C": source.sel_c[0] if rc.channel is None else int(rc.channel),
-            "Z": source.sel_z[len(source.sel_z) // 2] if rc.z is None else int(rc.z),
+            "Z": source.sel_z[len(source.sel_z) // 2] if zs is None else zs[len(zs) // 2],
             "T": source.sel_t[0] if rc.t is None else int(rc.t)}
 
 
@@ -223,7 +236,8 @@ def plan_scenes(source, cfg, backend, log=print, progress=None):
 
             if cfg.stitch_mode == "refine":
                 corr, slog = refine.register(source, cfg, backend, scene_id, rects, ref,
-                                             progress=progress)
+                                             progress=progress,
+                                             z_planes=registration_planes(source, cfg))
                 log(refine.format_report(slog))
             elif cfg.stitch_mode == "bigstitcher":
                 corr, slog = bigstitcher.corrections(cfg, scene_id, rects)

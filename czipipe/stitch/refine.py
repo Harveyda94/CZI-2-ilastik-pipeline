@@ -6,6 +6,12 @@ improves the match. That guard is deliberate. Sign and axis-order errors are the
 failure mode in stitching code and are invisible in the output until you notice the
 mosaic is mirrored; if the convention were wrong here, essentially every pair would be
 rejected and the report would say so.
+
+Registration is 2D. Each pair is measured at several Z planes and the planes are combined
+into one XY shift per pair, which makes the result independent of any single plane having
+structure in the overlaps, and lets the report say whether the planes agree. It does not
+make the stitch 3D: one XY correction per tile is applied to every plane, and a Z offset
+between tiles is not measured at all.
 """
 
 from __future__ import annotations
@@ -83,20 +89,100 @@ def solve_global(ms, edges):
     return corr, residual, [m for m in ms if m not in linked]
 
 
-def register(source, cfg, backend, scene_id, rects, ref_plane, progress=None):
-    """Per-tile integer corrections {m: (dy, dx)} plus a diagnostics record."""
+AGREE_PX = 1          # shifts are integers, so a true half-pixel shift reads as either side
+
+
+def sample_planes(sel_z, n):
+    """`n` Z planes spread through the selection: the centres of `n` equal slabs.
+
+    Slab centres rather than end-to-end spacing, because the first and last planes of a
+    stack are the ones most often above or below the sample. One plane gives the middle
+    of the selection, and any odd `n` includes it.
+    """
+    count = len(sel_z)
+    n = max(1, min(int(n), count))
+    return [sel_z[i] for i in sorted({int((k + 0.5) * count / n) for k in range(n)})]
+
+
+def _apart(a, b):
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
+
+
+def measure(backend, rc, z, A, ra, B, rb, sl):
+    """One pair at one plane: the shift it proposes and how that scores against metadata.
+
+    `reason` is empty when the plane is usable, i.e. the shift is within bounds, matches
+    well enough, and matches better than leaving the tiles where the stage put them.
+    `at` holds this plane's NCC at each shift scored on it, starting with its own.
+    """
+    s, sharp = phase_corr(backend, A[sl[0]], B[sl[1]], rc.max_shift)
+    base = score(A, ra, B, rb, (0, 0))
+    got = None if s is None else score(A, ra, B, rb, s)
+    if s is None:
+        reason = f"shift exceeds max_shift ({rc.max_shift} px)"
+    elif got < rc.min_ncc:
+        reason = f"ncc {got:.3f} < min_ncc"
+    elif got < base + rc.min_gain:
+        reason = f"no gain over metadata ({got:.3f} vs {base:.3f})"
+    else:
+        reason = ""
+    return {"z": z, "shift": s, "sharpness": sharp, "base": base, "got": got,
+            "at": {} if s is None else {s: got}, "reason": reason, "status": "unusable"}
+
+
+def choose(obs):
+    """The proposed shift that matches best over all of a pair's usable planes together.
+
+    Each usable plane proposes one shift, and by now has scored every proposal (`at`).
+    Summing those scores, rather than taking a vote or an average, means a plane counts
+    for as much as it has structure to match, a shift fitted to one plane's noise loses
+    to one that fits them all, and the answer is always a shift some plane measured,
+    never a blend that no plane supports. Ties go to the shift more planes proposed.
+    """
+    good = [o for o in obs if not o["reason"]]
+    if not good:
+        return None
+    proposed = [o["shift"] for o in good]
+    return max(dict.fromkeys(proposed),
+               key=lambda s: (sum(o["at"][s] for o in good), proposed.count(s)))
+
+
+def register(source, cfg, backend, scene_id, rects, ref_plane, progress=None,
+             z_planes=None):
+    """Per-tile integer corrections {m: (dy, dx)} plus a diagnostics record.
+
+    Each overlapping pair is measured independently at every plane in `z_planes` (the
+    reference plane alone if not given), and the planes are then combined per pair, so a
+    pair needs only one plane with usable structure. Tiles are read one plane at a time:
+    peak memory is one plane of the mosaic however many planes are used.
+
+    The correction is still a single XY shift per tile. Planes that fit a different
+    shift from the one chosen are therefore reported rather than acted on; see
+    `depth_summary`.
+    """
     rc = cfg.refine
     czi = source.aics()
-    kw = dict(ref_plane)
+    zs = [ref_plane["Z"]] if z_planes is None else z_planes
+    zs = list(dict.fromkeys(int(z) for z in zs))
+    if not zs:
+        raise ValueError("refine needs at least one Z plane to register on")
+    kw = {k: v for k, v in ref_plane.items() if k != "Z"}
     if scene_id is not None and "S" in czi.get_dims_shape()[0]:
         kw["S"] = scene_id
 
-    ms = sorted(rects)
-    planes = {}
-    for m in (progress(ms) if progress else ms):
-        planes[m] = np.squeeze(czi.read_image(M=m, **kw)[0])
+    def read_planes(wanted):
+        """(z, {m: tile}) for each (z, [m, ...]) wanted: one plane in memory at a time."""
+        todo = [(z, m) for z, need in wanted for m in need]
+        count = {z: len(need) for z, need in wanted}
+        tiles = {}
+        for z, m in (progress(todo) if progress and todo else todo):
+            tiles[m] = np.squeeze(czi.read_image(M=m, Z=z, **kw)[0])
+            if len(tiles) == count[z]:
+                yield z, tiles
+                tiles = {}
 
-    pairs, edges = [], []
+    ms = sorted(rects)
+    cands = []                                   # (mi, mj, slices, overlap, observations)
     for i, mi in enumerate(ms):
         for mj in ms[i + 1:]:
             sl = overlap_slices(rects[mi], rects[mj])
@@ -106,35 +192,123 @@ def register(source, cfg, backend, scene_id, rects, ref_plane, progress=None):
             ox = sl[0][1].stop - sl[0][1].start
             if min(oy, ox) < rc.min_overlap:
                 continue
-            s, sharp = phase_corr(backend, planes[mi][sl[0]], planes[mj][sl[1]], rc.max_shift)
-            base = score(planes[mi], rects[mi], planes[mj], rects[mj], (0, 0))
-            rec = {"i": mi, "j": mj, "overlap_px": [int(oy), int(ox)],
-                   "shift": list(s) if s else None, "sharpness": round(sharp, 1),
-                   "ncc_metadata": round(base, 4), "ncc_shifted": None,
-                   "accepted": False, "reason": ""}
-            if s is None:
-                rec["reason"] = f"shift exceeds max_shift ({rc.max_shift} px)"
+            cands.append((mi, mj, sl, [int(oy), int(ox)], []))
+
+    for z, tiles in read_planes([(z, ms) for z in zs]):
+        for mi, mj, sl, _, obs in cands:
+            obs.append(measure(backend, rc, z, tiles[mi], rects[mi], tiles[mj], rects[mj], sl))
+
+    # Where a pair's usable planes proposed more than one shift, every proposal is scored
+    # at each of those planes, so that the choice between them rests on how well each
+    # fits the whole stack. That needs the pixels again, for those pairs only.
+    contested = {}                               # z -> [(mi, mj, proposals, observation)]
+    for mi, mj, _, _, obs in cands:
+        good = [o for o in obs if not o["reason"]]
+        proposals = {o["shift"] for o in good}
+        if len(proposals) > 1:
+            for o in good:
+                contested.setdefault(o["z"], []).append((mi, mj, proposals, o))
+    wanted = [(z, sorted({m for mi, mj, _, _ in contested[z] for m in (mi, mj)}))
+              for z in zs if z in contested]
+    for z, tiles in read_planes(wanted):
+        for mi, mj, proposals, o in contested[z]:
+            for s in proposals - set(o["at"]):
+                o["at"][s] = score(tiles[mi], rects[mi], tiles[mj], rects[mj], s)
+
+    edges, picks = [], []
+    for mi, mj, _, _, obs in cands:
+        shift = choose(obs)
+        picks.append(shift)
+        if shift is None:
+            continue
+        good = [o for o in obs if not o["reason"]]
+        for o in good:
+            # A plane that proposed another shift is only evidence of an offset that
+            # changes with depth if the chosen shift is measurably worse *at that plane*.
+            # Where it scores about as well, the plane cannot tell the two apart
+            # (structure running along the seam, or noise moving a weak peak), and
+            # calling that a difference would be a false alarm.
+            if _apart(o["shift"], shift) <= AGREE_PX:
+                o["status"] = "agrees"
+            elif o["got"] - o["at"][shift] >= rc.min_gain:
+                o["status"] = "differs"
             else:
-                got = score(planes[mi], rects[mi], planes[mj], rects[mj], s)
-                rec["ncc_shifted"] = round(got, 4)
-                if got < rc.min_ncc:
-                    rec["reason"] = f"ncc {got:.3f} < min_ncc"
-                elif got < base + rc.min_gain:
-                    rec["reason"] = f"no gain over metadata ({got:.3f} vs {base:.3f})"
-                else:
-                    rec["accepted"] = True
-                    edges.append((mi, mj, s, max(got - base, 1e-3)))
-            pairs.append(rec)
-    del planes
+                o["status"] = "ambiguous"
+        edges.append((mi, mj, shift,
+                      max(sum(o["at"][shift] - o["base"] for o in good), 1e-3)))
+
+    pairs = []
+    for (mi, mj, _, overlap, obs), shift in zip(cands, picks):
+        if shift is None:
+            # A rejected pair reports the plane that came closest, so the reason given
+            # is the one that would have to change for the pair to be accepted.
+            shown = max(obs, key=lambda o: -1.0 if o["got"] is None else o["got"])
+        else:
+            shown = max((o for o in obs if not o["reason"] and o["shift"] == shift),
+                        key=lambda o: o["got"])
+        reason = shown["reason"]
+        if reason and len(zs) > 1:
+            reason += f" (best of {len(zs)} planes, Z {shown['z']})"
+        differing = [_apart(o["shift"], shift) for o in obs if o["status"] == "differs"]
+        pairs.append({
+            "i": mi, "j": mj, "overlap_px": overlap,
+            "shift": list(shown["shift"]) if shown["shift"] else None,
+            "sharpness": round(shown["sharpness"], 1),
+            "ncc_metadata": round(shown["base"], 4),
+            "ncc_shifted": None if shown["got"] is None else round(shown["got"], 4),
+            "accepted": shift is not None, "reason": reason, "z": shown["z"],
+            "planes_usable": sum(o["status"] != "unusable" for o in obs),
+            "depth_difference_px": max(differing, default=0),
+            "planes": [_plane_record(o, shift) for o in obs]})
 
     corr, residual, orphans = solve_global(ms, edges)
     n_ok = sum(p["accepted"] for p in pairs)
     mags = [abs(v[0]) + abs(v[1]) for v in corr.values()]
     log = {"scene": scene_id, "source": "refine", "reference_plane": ref_plane,
+           "z_planes": zs,
            "n_pairs": len(pairs), "n_accepted": n_ok, "rms_residual_px": residual,
            "unconstrained_tiles": orphans, "max_correction_px": max(mags) if mags else 0,
+           "depth": depth_summary(zs, pairs) if len(zs) > 1 else None,
            "pairs": pairs, "corrections": {str(m): list(v) for m, v in corr.items()}}
     return corr, log
+
+
+def _plane_record(o, chosen):
+    rec = {"z": o["z"], "shift": list(o["shift"]) if o["shift"] else None,
+           "sharpness": round(o["sharpness"], 1), "ncc_metadata": round(o["base"], 4),
+           "ncc_shifted": None if o["got"] is None else round(o["got"], 4),
+           "status": o["status"]}
+    if o["reason"]:
+        rec["reason"] = o["reason"]
+    elif o["shift"] != chosen:
+        rec["ncc_at_chosen_shift"] = round(o["at"][chosen], 4)
+    return rec
+
+
+def depth_summary(zs, pairs):
+    """How far the accepted pairs' shifts agree between the planes they were measured at.
+
+    Per plane, of the accepted pairs: how many were usable there, and how many of those
+    fit a shift more than AGREE_PX from the one chosen *and* fit it measurably better.
+    This is the only view the pipeline has of an XY offset that changes with depth. It
+    says nothing about tiles being offset in Z, which no step here measures.
+    """
+    acc = [p for p in pairs if p["accepted"]]
+    planes = []
+    for k, z in enumerate(zs):
+        obs = [(p, p["planes"][k]) for p in acc]
+        differ = [_apart(o["shift"], p["shift"]) for p, o in obs if o["status"] == "differs"]
+        planes.append({"z": z,
+                       "usable": sum(o["status"] != "unusable" for _, o in obs),
+                       "agree": sum(o["status"] == "agrees" for _, o in obs),
+                       "ambiguous": sum(o["status"] == "ambiguous" for _, o in obs),
+                       "differ": len(differ),
+                       "max_difference_px": max(differ, default=0)})
+    return {"planes": planes,
+            "pairs_compared": sum(p["planes_usable"] > 1 for p in acc),
+            "pairs_single_plane": sum(p["planes_usable"] == 1 for p in acc),
+            "pairs_differing": sum(p["depth_difference_px"] > 0 for p in acc),
+            "max_difference_px": max((p["depth_difference_px"] for p in acc), default=0)}
 
 
 def format_report(log):
@@ -148,10 +322,42 @@ def format_report(log):
         out.append(f"  [warn] {len(orphans)} tile(s) unconstrained {orphans[:8]}"
                    f"{' ...' if len(orphans) > 8 else ''} - left at metadata positions")
     out.append(f"  max |correction| {log['max_correction_px']} px")
+    zs = log.get("z_planes") or [log["reference_plane"]["Z"]]
     if log["n_accepted"] == 0 and log["n_pairs"]:
+        where = "this Z" if len(zs) == 1 else "these planes"
         out.append("  [warn] nothing accepted. Check refine.min_ncc / refine.max_shift, or "
-                   "the overlaps may be featureless at this Z. Using metadata positions.")
+                   f"the overlaps may be featureless at {where}. Using metadata positions.")
     elif log["rms_residual_px"] is not None and log["rms_residual_px"] > 2.0:
         out.append(f"  [warn] residual {log['rms_residual_px']:.2f} px is high for pure "
                    "translation; tiles may need rotation/affine (see BigStitcher).")
+    out.extend(_format_depth(log, zs))
     return "\n".join(out)
+
+
+def _format_depth(log, zs):
+    d = log.get("depth")
+    n = log["n_accepted"]
+    if not d or not n:
+        return []
+    width = max(len(str(z)) for z in zs)
+    out = [f"  depth check, Z {', '.join(str(z) for z in zs)}:"]
+    for p in d["planes"]:
+        line = f"    Z {p['z']:>{width}}: {p['usable']}/{n} accepted pairs usable"
+        if p["differ"]:
+            line += (f", {p['differ']} fit a different shift "
+                     f"(up to {p['max_difference_px']} px away)")
+        if p["ambiguous"]:
+            line += f", {p['ambiguous']} undecided between shifts"
+        out.append(line)
+    if d["pairs_differing"]:
+        out.append(f"  [warn] {d['pairs_differing']} pair(s) fit a different shift at some "
+                   f"depths, by up to {d['max_difference_px']} px. One XY correction per "
+                   "tile cannot fit every plane: expect seams offset by about that much "
+                   "at the planes marked above.")
+    elif d["pairs_compared"]:
+        out.append(f"    no depth fits a different shift, in any of the "
+                   f"{d['pairs_compared']} pair(s) usable at more than one plane")
+    if d["pairs_single_plane"]:
+        out.append(f"    {d['pairs_single_plane']} pair(s) were usable at one plane only, "
+                   "so were not compared between depths")
+    return out

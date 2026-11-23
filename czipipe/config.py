@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, asdict
+from numbers import Integral
 from pathlib import Path
 from typing import Optional, Sequence, Union
 
@@ -32,12 +33,32 @@ class RefineConfig:
     """Settings for `stitch_mode="refine"` (registration computed by this package)."""
 
     channel: Optional[int] = None       # correlation channel; None -> first selected
-    z: Optional[int] = None             # correlation plane; None -> middle of selection
+    z: Optional[Union[int, Sequence[int]]] = None
+                                        # correlation plane(s), as file Z indices; None ->
+                                        # `planes` of them spread through the selection
+    planes: int = 5                     # how many Z planes to register on when z is None.
+                                        # 1 = the middle plane only. More costs one read
+                                        # of every mosaic tile per plane, and is what lets
+                                        # the report compare shifts between depths.
     t: Optional[int] = None             # correlation timepoint; None -> first selected
     min_overlap: int = 32               # px; smaller overlaps are not attempted
     max_shift: int = 100                # px; larger implied corrections are rejected
     min_ncc: float = 0.20               # minimum normalised cross-correlation to accept
     min_gain: float = 0.02              # NCC must beat the metadata NCC by this much
+
+    def z_planes(self) -> Optional[list]:
+        """`z` as a list of distinct Z indices, or None when it is left to `planes`."""
+        if self.z is None:
+            return None
+        try:
+            zs = [self.z] if isinstance(self.z, Integral) else list(self.z)
+        except TypeError:
+            zs = []
+        if isinstance(self.z, (str, bytes)) or not zs or any(
+                isinstance(v, bool) or not isinstance(v, Integral) or v < 0 for v in zs):
+            raise ValueError("refine.z must be a Z index or a non-empty list of them, or "
+                             f"None to spread refine.planes automatically; got {self.z!r}")
+        return list(dict.fromkeys(int(v) for v in zs))
 
 
 @dataclass
@@ -223,6 +244,11 @@ class Config:
             raise ValueError(f"TIFF requires tile dimensions to be multiples of 16, got {self.tile}")
         if self.stitch_mode == "bigstitcher" and not self.bigstitcher.xml:
             raise ValueError('stitch_mode="bigstitcher" requires bigstitcher.xml')
+        if isinstance(self.refine.planes, bool) or not isinstance(self.refine.planes, int) \
+                or self.refine.planes < 1:
+            raise ValueError("refine.planes must be a positive int (1 = middle plane only), "
+                             f"got {self.refine.planes!r}")
+        self.refine.z_planes()
         if self.flatfield.mode not in ("none", "measured", "file", "basic"):
             raise ValueError('flatfield.mode must be "none", "measured", "file" or '
                              f'"basic", got {self.flatfield.mode!r}')
@@ -259,6 +285,10 @@ class Config:
         d = asdict(self)
         d["czi_path"] = str(self.czi_path)
         d["out_dir"] = str(self.out_dir)
+        if d["refine"]["z"] is not None and not isinstance(self.refine.z, Integral):
+            d["refine"]["z"] = self.refine.z_planes()      # plain ints, whatever was given
+        elif d["refine"]["z"] is not None:
+            d["refine"]["z"] = int(self.refine.z)
         if d["bigstitcher"].get("xml"):
             d["bigstitcher"]["xml"] = str(d["bigstitcher"]["xml"])
         if d["flatfield"].get("flat_file"):

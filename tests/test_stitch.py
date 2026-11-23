@@ -137,6 +137,239 @@ def test_global_solve_does_not_compound_error():
     assert resid > 0
 
 
+# ---------------------------------------------------------------- refine, several planes
+ZS = [0, 1, 2, 3, 4]
+MID = {"T": 0, "Z": 2, "C": 0}          # the plane a single-plane registration would use
+
+
+def make_stack(perts=None, dead=(), stripes=(), noise=0.0, seed=7):
+    """Per-tile (Z, Y, X) stacks with an unrelated image at each plane, and metadata rects.
+
+    `perts[z]` is the stage error at plane z (PERT where not given), planes in `dead`
+    hold noise in every tile, and planes in `stripes` vary down the image only, so they
+    pin a tile's dy and say nothing whatever about its dx. `noise` is added per tile.
+    """
+    side = 640 + 2 * PAD
+    stacks = {m: [] for m in POSITIONS}
+    for z in ZS:
+        pert = (perts or {}).get(z, PERT)
+        rng = np.random.default_rng(seed + 10 * z + 1)
+        if z in stripes:
+            gt = np.repeat(rng.integers(1000, 31000, (side, 1), dtype=np.uint16), side, axis=1)
+        else:
+            gt = smooth_image((side, side), seed=seed + 10 * z)
+        for m, (x, y) in POSITIONS.items():
+            tx, ty = x + pert[m][1] + PAD, y + pert[m][0] + PAD
+            t = gt[ty:ty + TS, tx:tx + TS]
+            assert t.shape == (TS, TS), f"tile {m} clipped by the ground-truth bounds"
+            if z in dead:
+                t = rng.integers(1000, 31000, (TS, TS), dtype=np.uint16)
+            elif noise:
+                t = np.clip(t + rng.normal(0, noise, t.shape), 0, 65535).astype(np.uint16)
+            stacks[m].append(t)
+    meta = {m: (x, y, TS, TS) for m, (x, y) in POSITIONS.items()}
+    return {m: np.stack(v) for m, v in stacks.items()}, meta
+
+
+def stack_source(cfg, stacks):
+    dummy = np.zeros((1, len(ZS), 1, 4, 4), np.uint16)
+    return FakeSource(dummy, (0, 0, 640, 640), [0], ZS, [0], cfg, tiles=stacks)
+
+
+def test_sample_planes_are_slab_centres():
+    assert refine.sample_planes(list(range(100)), 5) == [10, 30, 50, 70, 90]
+    assert refine.sample_planes(list(range(7)), 3) == [1, 3, 5]
+    assert refine.sample_planes([4, 5, 6], 5) == [4, 5, 6]            # no more than exist
+    assert refine.sample_planes(list(range(20, 60, 2)), 1) == [40]    # values, not positions
+
+
+def test_an_odd_number_of_planes_includes_the_middle_one():
+    """So adding planes can only add evidence to what one plane used to see."""
+    for count in (1, 2, 9, 10, 101):
+        for n in (1, 3, 5, 7):
+            sel = list(range(3, 3 + count))
+            planes = refine.sample_planes(sel, n)
+            assert sel[count // 2] in planes, (count, n)
+            assert planes == sorted(set(planes)) and len(planes) == min(n, count), (count, n)
+
+
+def test_one_plane_gives_no_depth_report(cfg):
+    stacks, meta = make_stack()
+    _, log = refine.register(stack_source(cfg, stacks), cfg, Backend(False), None, meta, MID)
+    assert log["z_planes"] == [2] and log["depth"] is None
+    assert "depth check" not in refine.format_report(log)
+
+
+def test_a_featureless_middle_plane_no_longer_loses_the_registration(cfg):
+    stacks, meta = make_stack(dead={2})
+    src = stack_source(cfg, stacks)
+    _, alone = refine.register(src, cfg, Backend(False), None, meta, MID)
+    assert alone["n_accepted"] == 0                       # all that one plane could give
+
+    corr, log = refine.register(src, cfg, Backend(False), None, meta, MID, z_planes=ZS)
+    assert corr == PERT
+    assert log["n_accepted"] == log["n_pairs"]
+    usable = [p["usable"] for p in log["depth"]["planes"]]
+    assert usable[2] == 0 and min(usable[:2] + usable[3:]) == log["n_pairs"]
+    assert log["depth"]["pairs_differing"] == 0
+
+
+def test_planes_that_agree_are_reported_as_agreeing(cfg):
+    stacks, meta = make_stack()
+    corr, log = refine.register(stack_source(cfg, stacks), cfg, Backend(False), None, meta,
+                                MID, z_planes=ZS)
+    assert corr == PERT
+    d = log["depth"]
+    assert d["pairs_differing"] == 0 and d["max_difference_px"] == 0
+    assert d["pairs_compared"] == log["n_accepted"] == log["n_pairs"]
+    assert all(p["usable"] == p["agree"] == log["n_pairs"] for p in d["planes"])
+    report = refine.format_report(log)
+    assert "depth check, Z 0, 1, 2, 3, 4" in report and "[warn]" not in report
+
+
+@pytest.mark.parametrize("noise", [100, 300, 800, 2000])
+def test_noise_alone_is_not_reported_as_a_depth_difference(cfg, noise):
+    """Every plane has the same true shift under independent noise. Individual planes
+    then propose shifts a pixel or more out, and those must read as undecided, not as
+    the sample moving with depth.
+
+    Measured over 12 seeds of this fixture (this test runs one): no pair flagged at
+    sd <= 800, one pair in one seed at sd=2000, and about one pair in every third seed
+    at sd=4000. Worst-tile error stays at 1 px through sd=2000, where a single plane
+    is already out by up to 3 px and has lost a quarter of its pairs."""
+    stacks, meta = make_stack(noise=noise)
+    src = stack_source(cfg, stacks)
+    corr, log = refine.register(src, cfg, Backend(False), None, meta, MID, z_planes=ZS)
+    errs = [max(abs(corr[m][0] - PERT[m][0]), abs(corr[m][1] - PERT[m][1])) for m in POSITIONS]
+    assert max(errs) <= 1
+    assert log["n_accepted"] == log["n_pairs"]
+    assert log["depth"]["pairs_differing"] == 0
+
+    alone, _ = refine.register(src, cfg, Backend(False), None, meta, MID)
+    worst = max(max(abs(alone[m][0] - PERT[m][0]), abs(alone[m][1] - PERT[m][1]))
+                for m in POSITIONS)
+    assert max(errs) <= worst                             # never worse than one plane
+
+
+def test_a_shift_that_changes_with_depth_is_reported_not_averaged(cfg):
+    """The centre tile sits 6 px further right in the two deepest planes. One XY shift
+    per tile cannot fit both, so the majority must win outright (a blend of the two would
+    be wrong at every plane) and the report must say which planes it does not fit."""
+    deep = dict(PERT)
+    deep[4] = (PERT[4][0], PERT[4][1] + 6)
+    stacks, meta = make_stack(perts={3: deep, 4: deep})
+    corr, log = refine.register(stack_source(cfg, stacks), cfg, Backend(False), None, meta,
+                                MID, z_planes=ZS)
+    assert corr == PERT
+    d = log["depth"]
+    assert d["max_difference_px"] == 6
+    differ = [p["differ"] for p in d["planes"]]
+    assert differ[:3] == [0, 0, 0] and differ[3] == differ[4] >= 4
+    assert [p["max_difference_px"] for p in d["planes"]] == [0, 0, 0, 6, 6]
+    for p in log["pairs"]:
+        assert (p["depth_difference_px"] > 0) == (4 in (p["i"], p["j"]))
+    report = refine.format_report(log)
+    assert "[warn]" in report and "up to 6 px" in report
+    import json
+    assert json.loads(json.dumps(log))["depth"] == d      # it is written to .stitch.json
+
+
+def test_two_planes_that_disagree_are_reported_with_the_tile_left_between_them(cfg):
+    """With one usable plane each way there is no majority, and each pair settles it on
+    its own: some take one plane's shift and some the other's, so the solve leaves the
+    tile somewhere between the two, and its inconsistent edges can pull a neighbour by
+    a pixel. Nothing better is knowable from two planes; what matters is that the tile
+    stays inside their range, the damage stays local, and every pair is reported."""
+    deep = dict(PERT)
+    deep[4] = (PERT[4][0], PERT[4][1] + 6)
+    stacks, meta = make_stack(perts={4: deep}, dead={0, 1, 2})
+    corr, log = refine.register(stack_source(cfg, stacks), cfg, Backend(False), None, meta,
+                                MID, z_planes=ZS)
+    assert corr[4][0] == PERT[4][0] and PERT[4][1] <= corr[4][1] <= deep[4][1]
+    assert all(max(abs(corr[m][0] - PERT[m][0]), abs(corr[m][1] - PERT[m][1])) <= 1
+               for m in POSITIONS if m != 4)
+    assert log["rms_residual_px"] > 0.5                   # and the fit says so too
+    d = log["depth"]
+    assert d["pairs_differing"] == 8 and d["max_difference_px"] == 6
+    assert all(p["planes_usable"] == 2 for p in log["pairs"])
+
+
+def test_a_plane_that_cannot_tell_two_shifts_apart_is_not_a_depth_difference(cfg):
+    """Structure running across a seam fixes one axis of the shift and leaves the other
+    free. Phase correlation still names a shift on the free axis (zero, here), often
+    several pixels from the true one, but the chosen shift fits that plane exactly as
+    well, so it is no evidence that the shift changes with depth."""
+    stacks, meta = make_stack(stripes={4})
+    corr, log = refine.register(stack_source(cfg, stacks), cfg, Backend(False), None, meta,
+                                MID, z_planes=ZS)
+    assert corr == PERT
+    striped = log["depth"]["planes"][4]
+    assert striped["usable"] == log["n_pairs"]
+    assert striped["ambiguous"] >= 10 and striped["differ"] == 0
+    assert log["depth"]["pairs_differing"] == 0
+    report = refine.format_report(log)
+    assert "undecided between shifts" in report and "[warn]" not in report
+
+
+def test_a_rejected_pair_names_the_plane_that_came_closest(cfg):
+    stacks, meta = make_stack()
+    for m in stacks:
+        stacks[m][:, :, :] = np.random.default_rng(m).integers(
+            1000, 31000, stacks[m].shape, dtype=np.uint16)
+    _, log = refine.register(stack_source(cfg, stacks), cfg, Backend(False), None, meta,
+                             MID, z_planes=ZS)
+    assert log["n_accepted"] == 0 and log["depth"]["pairs_compared"] == 0
+    assert all("best of 5 planes, Z " in p["reason"] for p in log["pairs"])
+    report = refine.format_report(log)
+    assert "featureless at these planes" in report and "depth check" not in report
+
+
+def test_plan_registers_on_the_configured_planes(cfg, monkeypatch):
+    from czipipe import plan as planmod
+
+    stacks, meta = make_stack()
+    src = stack_source(cfg, stacks)
+    monkeypatch.setattr(planmod, "mosaic_geometry",
+                        lambda source, scene_id, ref: (dict(meta), (0, 0)))
+    cfg.stitch_mode = "refine"
+
+    def planes(**refine_settings):
+        for k, v in refine_settings.items():
+            setattr(cfg.refine, k, v)
+        plan = planmod.plan_scenes(src, cfg, Backend(False), log=lambda *a: None)[0]
+        assert plan.corrections == PERT
+        return plan.stitch_log["z_planes"]
+
+    assert planes() == ZS                                 # five by default, all there are
+    assert planes(planes=3) == [0, 2, 4]
+    assert planes(planes=1) == [2]                        # the old behaviour
+    assert planes(z=[1, 3, 3]) == [1, 3]                  # explicit planes win
+    assert planes(z=4) == [4]
+
+
+def test_refine_planes_must_be_a_positive_int(cfg):
+    for bad in (0, -1, 2.5, True, "3"):
+        cfg.refine.planes = bad
+        with pytest.raises(ValueError, match="refine.planes"):
+            cfg.validate()
+
+
+def test_refine_z_must_be_plane_indices(cfg):
+    # Looped, not parametrized: tools/minipytest.py unpacks a list-valued parameter.
+    for bad in ([], -1, [0, -2], "3", [1.5], True, 2.0):
+        cfg.refine.z = bad
+        with pytest.raises(ValueError, match="refine.z"):
+            cfg.validate()
+
+
+def test_refine_z_accepts_numpy_indices_and_stays_serialisable(cfg):
+    import json
+
+    cfg.refine.z = np.arange(2, 8, 2)
+    assert cfg.validate().refine.z_planes() == [2, 4, 6]
+    assert json.loads(json.dumps(cfg.to_dict()))["refine"]["z"] == [2, 4, 6]
+
+
 # ---------------------------------------------------------------- compositor
 def test_composite_is_bit_exact(cfg):
     gt, tiles, meta = make_mosaic()
