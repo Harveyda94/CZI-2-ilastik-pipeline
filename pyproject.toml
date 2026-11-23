@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "czipipe"
+version = "1.0.0"
+description = "Streaming CZI to OME-TIFF/HDF5 conversion with stitching and ilastik segmentation"
+requires-python = ">=3.9,<3.14"
+dependencies = ["numpy", "tifffile", "imagecodecs", "pylibCZIrw", "tqdm"]
+
+[project.optional-dependencies]
+stitch = ["aicspylibczi", "scipy", "matplotlib"]
+flatfield = ["aicspylibczi", "basicpy"]
+hdf5 = ["h5py"]
+ilastik = ["h5py", "psutil"]
+gpu = ["cupy-cuda12x"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["czipipe*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]

@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Image data and pipeline outputs
+*.czi
+*.tif
+*.tiff
+*.h5
+*.hdf5
+*.ilp
