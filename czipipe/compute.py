@@ -78,19 +78,45 @@ class Backend:
         return g.astype(np.uint8)
 
     def fft_phase_correlation(self, a, b):
-        """Normalised cross-power spectrum; returns the correlation surface."""
+        """Normalised cross-power spectrum; returns the correlation surface.
+
+        `a` and `b` are two planes, or two (Z, Y, X) volumes for 3D registration. A
+        volume is transformed in single precision: the peak is what matters, and at full
+        resolution an overlap volume is large enough that doubling it shows in the RAM.
+        """
         a = np.asarray(a, np.float32)
         b = np.asarray(b, np.float32)
         a = a - a.mean()
         b = b - b.mean()
-        win = np.hanning(a.shape[0])[:, None] * np.hanning(a.shape[1])[None, :]
+        win = np.hanning(a.shape[0])
+        for n in a.shape[1:]:
+            win = np.multiply.outer(win, np.hanning(n))
+        if a.ndim > 2:
+            win = win.astype(np.float32)
         if self.gpu:
             cp = self.cp
             with self._lock:
                 ga, gb, gw = cp.asarray(a), cp.asarray(b), cp.asarray(win)
-                R = cp.fft.rfft2(ga * gw) * cp.conj(cp.fft.rfft2(gb * gw))
+                R = cp.fft.rfftn(ga * gw) * cp.conj(cp.fft.rfftn(gb * gw))
                 R /= cp.maximum(cp.abs(R), 1e-12)
-                return cp.asnumpy(cp.fft.irfft2(R, s=a.shape))
-        R = np.fft.rfft2(a * win) * np.conj(np.fft.rfft2(b * win))
+                return cp.asnumpy(cp.fft.irfftn(R, s=a.shape, axes=tuple(range(a.ndim))))
+        if a.ndim == 2:
+            R = np.fft.rfft2(a * win) * np.conj(np.fft.rfft2(b * win))
+            R /= np.maximum(np.abs(R), 1e-12)
+            return np.fft.irfft2(R, s=a.shape)
+        # A volume: work in place where possible, and across cores when scipy is there
+        # to do it (numpy's FFT is single-threaded).
+        a *= win
+        b *= win
+        rfftn, irfftn, kw = np.fft.rfftn, np.fft.irfftn, {}
+        try:
+            from scipy import fft as sfft
+            rfftn, irfftn, kw = sfft.rfftn, sfft.irfftn, {"workers": -1}
+        except ImportError:
+            pass
+        R = rfftn(a, **kw)
+        del a
+        R *= np.conj(rfftn(b, **kw))
+        del b
         R /= np.maximum(np.abs(R), 1e-12)
-        return np.fft.irfft2(R, s=a.shape)
+        return irfftn(R, s=win.shape, axes=tuple(range(win.ndim)), **kw)

@@ -395,6 +395,12 @@ def _settings_payload(source, cfg, plan, shape):
         # Present only in this case, so every other fingerprint is unchanged and existing
         # outputs keep being recognised. See _unapplied_flatfield for what it separates.
         payload["flatfield_applied"] = "per mosaic tile"
+    zshift = {str(k): int(v[2]) for k, v in sorted((plan.corrections or {}).items())
+              if len(v) > 2 and v[2]}
+    if zshift:
+        # 3D registration that moved a tile along Z. Likewise present only then: with no
+        # Z offset the pixels are those of the same XY corrections on their own.
+        payload["corrections_z"] = zshift
     return payload
 
 

@@ -86,7 +86,10 @@ class Pipeline:
                            self.source.sel_c, self.source.samples)
         self.log(f"input       {cfg.czi_path}  ({cfg.czi_path.stat().st_size / 1e9:.1f} GB)")
         self.log(f"output      {cfg.out_dir}  [{cfg.output_format}]")
-        self.log(f"stitching   {cfg.stitch_mode}    compute  {self.backend.name}")
+        mode = cfg.stitch_mode
+        if mode == "refine" and cfg.refine.mode == "3d":
+            mode += " (3d: XY and Z)"
+        self.log(f"stitching   {mode}    compute  {self.backend.name}")
         self.log("")
         self.log(self.source.describe())
         peak = (cfg.prefetch * cfg.tile[0] * cfg.tile[1]

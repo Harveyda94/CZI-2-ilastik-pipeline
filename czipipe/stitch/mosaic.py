@@ -1,7 +1,9 @@
 """Mosaic tile geometry and the memory-bounded compositor.
 
 The compositor is shared by `refine` and `bigstitcher`: both produce a
-{mosaic_index: (dy, dx)} correction dict, and everything downstream is identical.
+{mosaic_index: (dy, dx)} correction dict, and everything downstream is identical. 3D
+registration (`refine.mode = "3d"`) gives (dy, dx, dz), and the compositor then also
+takes each tile from the plane its Z offset says belongs at the plane being written.
 """
 
 from __future__ import annotations
@@ -100,7 +102,15 @@ class MosaicCompositor:
         self._limit = int(cfg.mosaic_cache_mb * 1e6)
         self._lock = threading.Lock()
         self._weights = {}
-        self._has_S = "S" in source.aics().get_dims_shape()[0]
+        dims = source.aics().get_dims_shape()[0]
+        self._has_S = "S" in dims
+        # A correction may carry a third component, dz: the tile's planes belong dz
+        # planes further along Z than the file says. Output plane z therefore takes the
+        # tile's plane z - dz, and where the file has no such plane the tile has nothing
+        # to give: it is left out there rather than filled from a neighbouring plane.
+        self.z_shift = {m: int(c[2]) for m, c in corrections.items()
+                        if m in rects and len(c) > 2 and c[2]}
+        self._z_range = dims.get("Z")
 
     # -- tile access --------------------------------------------------------
     def _fetch(self, key):
@@ -159,6 +169,17 @@ class MosaicCompositor:
         return w
 
     # -- compositing --------------------------------------------------------
+    def source_plane(self, m, z):
+        """The plane of tile `m` that belongs at output plane `z`, or None if the file
+        does not hold it (the tile's Z offset reaches past the end of the stack)."""
+        dz = self.z_shift.get(m)
+        if not dz:
+            return z
+        zm = z - dz
+        if self._z_range is not None and not self._z_range[0] <= zm < self._z_range[1]:
+            return None
+        return zm
+
     def tile(self, t, z, c, x0, y0, w, h, level=0):
         """Composite the full-resolution region (x0, y0, w, h), decimated by 2**level."""
         step = 1 << level
@@ -176,7 +197,10 @@ class MosaicCompositor:
             ky1 = min(ny - 1, (my + mh - 1 - y0) // step)
             if kx1 < kx0 or ky1 < ky0:
                 continue
-            src = self._fetch((t, z, c, m))
+            zm = self.source_plane(m, z)
+            if zm is None:
+                continue
+            src = self._fetch((t, zm, c, m))
             sy, sx = y0 + ky0 * step - my, x0 + kx0 * step - mx
             ys = slice(sy, sy + (ky1 - ky0) * step + 1, step)
             xs = slice(sx, sx + (kx1 - kx0) * step + 1, step)

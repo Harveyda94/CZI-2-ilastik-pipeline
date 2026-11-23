@@ -12,7 +12,8 @@ from typing import Optional
 import numpy as np
 
 from . import flatfield as ff
-from .stitch import MosaicCompositor, mosaic_geometry, describe_grid, refine, bigstitcher
+from .stitch import (MosaicCompositor, mosaic_geometry, describe_grid, refine, refine3d,
+                     bigstitcher)
 
 
 @dataclass
@@ -234,7 +235,11 @@ def plan_scenes(source, cfg, backend, log=print, progress=None):
                 f"tile {g['tile_w']} x {g['tile_h']} px, overlap "
                 f"~{g['overlap_x_pct']:.1f}% x / {g['overlap_y_pct']:.1f}% y")
 
-            if cfg.stitch_mode == "refine":
+            if cfg.stitch_mode == "refine" and cfg.refine.mode == "3d":
+                corr, slog = refine3d.register(source, cfg, backend, scene_id, rects, ref,
+                                               progress=progress)
+                log(refine3d.format_report(slog))
+            elif cfg.stitch_mode == "refine":
                 corr, slog = refine.register(source, cfg, backend, scene_id, rects, ref,
                                              progress=progress,
                                              z_planes=registration_planes(source, cfg))

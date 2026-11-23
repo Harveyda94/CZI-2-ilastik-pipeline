@@ -164,6 +164,11 @@ cfg.refine.planes    = 5           # Z planes to register on, spread through the
 cfg.refine.z         = None        # or name them yourself: a Z index, or a list of them
 cfg.refine.min_ncc   = 0.20
 cfg.refine.max_shift = 100
+cfg.refine.mode        = "2d"      # "2d": one XY shift per tile. "3d": also a Z shift per
+                                   # tile, for tiles whose stacks sit planes apart
+cfg.refine.slab        = 16        # "3d": consecutive Z planes correlated together, around
+                                   # each of the planes above
+cfg.refine.max_shift_z = 5         # "3d": largest Z correction accepted, in planes
 
 cfg.bigstitcher.xml  = None        # dataset.xml saved by BigStitcher
 
@@ -235,6 +240,11 @@ If `stitch_mode` is `refine`, three things to read appear here:
   shift at some depths: one shift per tile cannot be right at every plane, and the seams
   will be offset by about the stated amount at the planes listed. It is a report, not a
   correction, and it cannot see tiles that are offset from each other in Z.
+
+With `cfg.refine.mode = "3d"` the same report gains a Z part: the range of **Z
+corrections** (in planes, relative to the median tile), the Z residual, and a `[note]`
+listing any output planes that lack some tiles because their Z offset reaches past the
+end of the stack. The depth check is then per slab of planes rather than per plane.
 """)
 
 code(r'''
@@ -385,11 +395,20 @@ the CZI, so no resaved copy is needed. All three feed the same compositor.
 rotation, shear, or multi-angle/multi-illumination data. Those need BigStitcher's own
 fusion; fuse there and run this over the fused output with `metadata`.
 
-**Registration is 2D.** `refine` measures each overlap at several Z planes, but combines
-them into a single XY shift per tile that is applied to every Z, C and T. Right for a
-stage-scanned mosaic. If the offset changes with depth the plan output says so, but does
-not correct it, and a Z offset between tiles is not measured at all. Chromatic offsets
-between channels are not corrected.
+**Registration is 2D unless you ask.** `refine` measures each overlap at several Z planes,
+but combines them into a single XY shift per tile that is applied to every Z, C and T.
+Right for a stage-scanned mosaic whose tiles share their Z planes. If the offset changes
+with depth the plan output says so, but does not correct it. Chromatic offsets between
+channels are not corrected.
+
+**3D registration.** If tiles sit a plane or more apart in Z, seams look right at some
+depths and doubled at others, and no XY shift fixes it. `cfg.refine.mode = "3d"`
+correlates each overlap as a volume and gives every tile a Z correction as well, in
+whole planes; each tile is then taken from the plane that belongs at the one being
+written. It reads far more of the file to register (every tile once per plane of every
+slab), and the first and last few output planes can lack the tiles whose offset reaches
+past the end of the stack. It has been tested on synthetic data only so far, so check
+the preview at a few depths before a long run.
 
 **Flat-field correction is per field of view**, so it only works where individual fields
 are still separable. On a mosaic that means the per-tile path: `refine`, `bigstitcher`,

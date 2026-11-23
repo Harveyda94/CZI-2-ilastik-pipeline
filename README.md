@@ -98,8 +98,9 @@ p.preview_segmentation(seg)   # raw channels beside the labels at a few depths
 
 ## Registration with `stitch_mode="refine"`
 
-`refine` corrects the stage positions by a single integer XY shift per tile. It is 2D:
-the same shift is applied to every Z plane, channel and timepoint.
+`refine` corrects the stage positions by a single integer XY shift per tile. By default
+it is 2D: the same shift is applied to every Z plane, channel and timepoint. Set
+`cfg.refine.mode = "3d"` to register along Z as well ([below](#3d-registration)).
 
 Each overlapping pair of tiles is phase-correlated at several Z planes
 (`cfg.refine.planes`, default 5, taken at the centres of equal slabs of the Z selection;
@@ -136,8 +137,71 @@ scene 0: 20/20 pairs accepted, RMS residual 0.00 px
   It is not counted as a difference.
 
 The depth check compares XY shifts between planes. It cannot see tiles that are offset
-from each other in Z; nothing in the pipeline measures that. `refine.planes = 1` is the
-old single-plane behaviour, with no depth check.
+from each other in Z; that takes `refine.mode = "3d"`. `refine.planes = 1` is the old
+single-plane behaviour, with no depth check.
+
+### 3D registration
+
+```python
+cfg.stitch_mode = "refine"
+cfg.refine.mode = "3d"        # default "2d"
+cfg.refine.slab = 16          # consecutive Z planes correlated together
+cfg.refine.max_shift_z = 5    # planes; larger implied Z corrections are rejected
+```
+
+A tile's stack can sit a plane or more above or below its neighbour's. Registering one
+plane at a time cannot see that, and blends each tile against the wrong planes of the
+next however good the XY fit. In `"3d"` mode each overlapping pair is phase-correlated
+as a volume, over a *slab* of `refine.slab` consecutive planes of the overlap, which
+gives a shift (dy, dx, dz) in one measurement. Every tile then gets an integer
+correction in XY **and** Z, and during conversion each tile is taken from the plane its
+Z offset says belongs at the plane being written.
+
+- **Where it measures.** `refine.planes` slabs (default 5) spread through the Z
+  selection without overlapping, or one slab around each plane named in `refine.z`. A
+  stack too shallow for that many gets as many as fit. At most `(slab - 1) // 2` planes
+  of Z offset are searched, so a thin slab limits `max_shift_z`; the report states the
+  range actually searched.
+- **What is accepted.** As in 2D, a shift must match well (`min_ncc`) and measurably
+  better than the stage position (`min_gain`). The XY part and the Z part are each held
+  to that on their own: a Z offset is kept only if it beats the same XY shift without
+  it, and the other way about. Without that, getting one right carries the other through
+  with it, wrong sign included. A pair that matches best where the stage already put it
+  is kept as a weak constraint, so tiles the stage has right hold each other in place.
+- **What Z corrections are relative to.** XY is pinned at the first tile, as in 2D. Along
+  Z the median tile keeps its own planes, so as few stacks as possible are moved.
+- **The ends of the stack.** The output has the planes you selected and no others. A
+  tile corrected by +2 planes has nothing to give the first two planes of the file, and
+  is left out there rather than filled from a neighbouring plane; the report lists the
+  planes affected. Tiles are taken from anywhere in the file, so a `z_range` that stops
+  short of the ends by a few planes loses nothing.
+
+```
+scene 0: 20/20 pairs accepted, RMS residual 0.00 px, 0.00 planes in Z
+  3D registration on 3 slab(s) of 8 planes (Z 0-7, 8-15, 16-23), Z offsets searched to +/-3 planes
+  max |correction| 9 px; Z corrections -1 to +1 planes
+  [note] 2 of 24 output plane(s) lack some tiles (Z 0, 23): their Z offset reaches past
+  the end of the stack there, and no plane is invented to fill the gap.
+  depth check, slab by slab:
+    Z   0-7: 20/20 accepted pairs usable
+    Z  8-15: 20/20 accepted pairs usable
+    Z 16-23: 20/20 accepted pairs usable
+    no depth fits a different shift, in any of the 20 pair(s) usable in more than one slab
+```
+
+The depth check reads as in 2D, slab by slab. It is still one translation per tile: a
+tile tilted or sheared against its neighbour shows up there as a shift that changes
+with depth, and is reported, not corrected.
+
+**Cost.** Every mosaic tile is read once per plane of every slab (80 planes per tile at
+the defaults, against 5 in 2D). Some are read again: where a pair's slabs proposed
+shifts the others had not already scored, and where the overlap volumes do not all fit
+`mosaic_cache_mb` at once, since pairs are then measured in batches and the tiles shared
+between batches are read for each. Memory is that cap plus the working set for one
+pair. In a synthetic benchmark with 1920 px tiles and 10% overlap, a pair took about a
+quarter of a second per slab on an 18-core Mac, and six tiles peaked about 0.4 GB above
+where they started. `.stitch.json` records every pair's shift in every slab, and
+corrections as `[dy, dx, dz]`.
 
 ## Interrupting and restarting
 
@@ -190,6 +254,7 @@ Every stage can be interrupted and re-run; nothing that finished is redone.
 | `ilastik.py` | headless classification and result conversion |
 | `stitch/mosaic.py` | tile geometry and the memory-bounded compositor |
 | `stitch/refine.py` | multi-plane phase correlation, the global least-squares solve, the depth check |
+| `stitch/refine3d.py` | 3D registration: slab phase correlation, an XY and Z shift per tile |
 | `stitch/bigstitcher.py` | BDV XML transform import |
 | `pipeline.py` | `Pipeline`, the orchestration the notebook calls |
 | `bench.py` | stage timing |
@@ -197,7 +262,7 @@ Every stage can be interrupted and re-run; nothing that finished is redone.
 ## Tests
 
 ```bash
-python -m pytest                  # 190 tests
+python -m pytest                  # 286 tests
 python tools/minipytest.py        # if pytest is unavailable
 ```
 
@@ -218,6 +283,17 @@ plane of stripes, which cannot fix one axis, is not reported; and noise alone is
 reported either. Measured over 12 seeds, no pair is falsely flagged up to a noise sd of
 800, one pair in one seed at 2000, and about one pair in every third seed at 4000, by
 which point a single plane has lost a third of its pairs.
+
+3D registration is checked on a synthetic volume whose tiles are cut at known XY and Z
+offsets. It recovers every offset exactly, and over 6 seeds still does at a noise sd of
+300; at 800 and 2000 the worst tile is one pixel out in XY, with Z still exact. The
+composite then equals the truth at every plane, seams included, while the same XY
+corrections without the Z ones do not. The guards are tested by breaking the convention on purpose: with the Z sign
+inverted no tile is moved along Z, and with the XY sign inverted the mirror of a true
+shift is never accepted. Also covered: a Z offset beyond `max_shift_z` is rejected
+rather than clipped, a featureless slab, an offset that changes with depth, batches
+under a small memory cap giving the identical result, and an output's fingerprint
+changing only when a tile actually moves along Z.
 
 Flat-field is checked against a known synthetic vignette: the estimator recovers it to
 under 0.05 worst-pixel, correction reduces residual shading error by more than 3x, and
@@ -292,11 +368,17 @@ Found by review rather than in the field:
   reroutes through the same compositor). Once libCZI has blended a mosaic the fields are
   gone. The `measured` estimator assumes sample content is uncorrelated with position
   within the field; the split-half diagnostic reports when it is not.
-- **Registration is 2D.** `refine` measures several Z planes but applies one XY shift per
-  tile to all Z/C/T. An offset that changes with depth is reported by the depth check and
-  not corrected; with only two usable planes that disagree, the tile is left between the
-  two. A Z offset between tiles is not measured at all, in any mode. No chromatic
-  correction.
+- **Registration is one translation per tile.** By default `refine` is 2D: it measures
+  several Z planes but applies one XY shift per tile to all Z/C/T, and a Z offset between
+  tiles is not measured. `refine.mode = "3d"` measures and corrects that too, in whole
+  planes. In either mode an offset that changes with depth (a tilted or sheared tile) is
+  reported by the depth check and not corrected; with only two usable planes that
+  disagree, the tile is left between the two. No chromatic correction.
+- **3D registration has only been run on synthetic data**, not yet on a real CZI. Look at
+  `preview()` and the report before a long conversion. It does not interpolate between
+  planes, so a true half-plane offset is corrected to the nearer whole plane, and it
+  does not add planes: the first and last few output planes can lack the tiles whose
+  offset reaches past the end of the stack. `bigstitcher` mode still applies XY only.
 - **`bigstitcher` mode is translation-only**, and refuses rotation, shear, multi-angle and
   multi-illumination rather than dropping them silently.
 - **TIFF cannot resume mid-file.** Sequential format; an interrupted TIFF starts again

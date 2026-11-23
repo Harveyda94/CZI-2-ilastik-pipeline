@@ -11,7 +11,7 @@ Registration is 2D. Each pair is measured at several Z planes and the planes are
 into one XY shift per pair, which makes the result independent of any single plane having
 structure in the overlaps, and lets the report say whether the planes agree. It does not
 make the stitch 3D: one XY correction per tile is applied to every plane, and a Z offset
-between tiles is not measured at all.
+between tiles is not measured here at all. `refine.mode = "3d"` does that; see refine3d.
 """
 
 from __future__ import annotations
@@ -291,7 +291,8 @@ def depth_summary(zs, pairs):
     Per plane, of the accepted pairs: how many were usable there, and how many of those
     fit a shift more than AGREE_PX from the one chosen *and* fit it measurably better.
     This is the only view the pipeline has of an XY offset that changes with depth. It
-    says nothing about tiles being offset in Z, which no step here measures.
+    says nothing about tiles being offset in Z, which this module does not measure
+    (refine3d does).
     """
     acc = [p for p in pairs if p["accepted"]]
     planes = []

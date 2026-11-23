@@ -45,6 +45,17 @@ class RefineConfig:
     max_shift: int = 100                # px; larger implied corrections are rejected
     min_ncc: float = 0.20               # minimum normalised cross-correlation to accept
     min_gain: float = 0.02              # NCC must beat the metadata NCC by this much
+    mode: str = "2d"                    # "2d": one XY shift per tile, measured a plane at
+                                        # a time. "3d": an XY and a Z shift per tile, from
+                                        # 3D phase correlation of the overlap volumes; the
+                                        # tile is then also taken from the plane its Z
+                                        # offset says belongs at the plane being written.
+    slab: int = 16                      # "3d": consecutive Z planes correlated around each
+                                        # registration plane (`planes` of them, or one per
+                                        # entry of `z`). Reads every mosaic tile once per
+                                        # plane of every slab.
+    max_shift_z: int = 5                # "3d": planes; larger implied Z corrections are
+                                        # rejected. At most (slab - 1) // 2 is searched.
 
     def z_planes(self) -> Optional[list]:
         """`z` as a list of distinct Z indices, or None when it is left to `planes`."""
@@ -249,6 +260,13 @@ class Config:
             raise ValueError("refine.planes must be a positive int (1 = middle plane only), "
                              f"got {self.refine.planes!r}")
         self.refine.z_planes()
+        if self.refine.mode not in ("2d", "3d"):
+            raise ValueError(f'refine.mode must be "2d" or "3d", got {self.refine.mode!r}')
+        for name, least in (("slab", 3), ("max_shift_z", 1)):
+            v = getattr(self.refine, name)
+            if isinstance(v, bool) or not isinstance(v, int) or v < least:
+                raise ValueError(f"refine.{name} must be an int of at least {least}, "
+                                 f"got {v!r}")
         if self.flatfield.mode not in ("none", "measured", "file", "basic"):
             raise ValueError('flatfield.mode must be "none", "measured", "file" or '
                              f'"basic", got {self.flatfield.mode!r}')
