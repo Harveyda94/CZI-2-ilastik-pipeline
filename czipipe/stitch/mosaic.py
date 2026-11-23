@@ -12,6 +12,7 @@ from concurrent.futures import Future
 import numpy as np
 
 from ..compute import cast_to
+from ..geometry import overview_level
 
 
 def bbox_xywh(b):
@@ -204,7 +205,7 @@ class MosaicCompositor:
 
     def preview(self, t, z, c, max_px=1200):
         x, y, w, h = self.rect
-        level = max(0, int(np.ceil(np.log2(max(w, h) / max_px)))) if max(w, h) > max_px else 0
+        level = overview_level(w, h, max_px)
         step = 1 << level
         return self.tile(t, z, c, x, y, (w // step) * step, (h // step) * step, level), level
 

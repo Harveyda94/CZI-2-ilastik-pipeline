@@ -379,3 +379,44 @@ def test_verify_with_nothing_attached_is_an_error_not_a_pass(cfg):
     with pytest.raises(RuntimeError, match="nothing to verify"):
         Pipeline(cfg, log=msgs.append).verify()
     assert not any("PASSED" in str(m) for m in msgs)
+
+
+# ---------------------------------------------------------------- stitching preview
+def _pipeline(cfg, src, plan, log=lambda *a: None):
+    from czipipe.pipeline import Pipeline
+    p = Pipeline(cfg, log=log)
+    p.source, p.plans = src, [plan]
+    return p
+
+
+@pytest.mark.parametrize("max_px,level", [(100, 2), (40, 3)])
+def test_metadata_mode_previews_the_libczi_composite(cfg, max_px, level):
+    """A plain `metadata` plan has no compositor, and preview() used to skip it: the one
+    mode the notes say to try first and look at drew nothing to look at."""
+    src, tiler, plan, data = build(cfg)
+    assert plan.compositor is None
+    [(got, img, lvl)] = _pipeline(cfg, src, plan).preview(max_px=max_px)
+    assert got is plan and lvl == level
+    step = 1 << level
+    h, w = (RECT[3] // step) * step, (RECT[2] // step) * step
+    # first T and C, middle Z of the selection: the plane every mode previews
+    assert np.array_equal(img, data[0, 1, 0, :h:step, :w:step])
+
+
+def test_metadata_preview_is_full_resolution_when_it_fits(cfg):
+    src, tiler, plan, data = build(cfg)
+    [(_, img, lvl)] = _pipeline(cfg, src, plan).preview(max_px=1200)
+    assert lvl == 0 and np.array_equal(img, data[0, 1, 0])
+
+
+def test_metadata_preview_shows_the_pixels_convert_will_write(cfg):
+    """Flat-field included: an overview that left it out would not be what gets written."""
+    from czipipe import flatfield as ff
+    src, tiler, plan, data = build(cfg)
+    yy, xx = np.mgrid[0:RECT[3], 0:RECT[2]]
+    plan.flatfields = {c: ff.build(0.7 + 0.6 * (xx / RECT[2]) * (yy / RECT[3]))
+                       for c in SEL_C}
+    [(_, img, _)] = _pipeline(cfg, src, plan).preview(max_px=1200)
+    assert img.dtype == np.uint16 and not np.array_equal(img, data[0, 1, 0])
+    work = make_worker(src, cfg, Backend(False), tiler, plan, 0)
+    assert np.array_equal(img[:64, :64], work((0, 1, 0, RECT[0], RECT[1], 64, 64)))

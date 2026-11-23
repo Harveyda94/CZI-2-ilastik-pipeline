@@ -11,11 +11,12 @@ from typing import List, Optional
 import numpy as np
 
 from .compute import Backend
-from .geometry import Tiler
+from .geometry import Tiler, overview_level
 from .plan import ScenePlan, plan_scenes
 from .source import Source
+from .stitch import mosaic_geometry
 from .validate import verify as verify_output, report_h5_check
-from .worker import make_worker
+from .worker import make_libczi_reader, make_worker
 from .writers import WRITERS
 
 
@@ -103,19 +104,59 @@ class Pipeline:
         return self.plans
 
     # -- work ---------------------------------------------------------------
+    def _preview_plane(self):
+        src = self.source
+        return {"T": src.sel_t[0], "Z": src.sel_z[len(src.sel_z) // 2], "C": src.sel_c[0]}
+
     def preview(self, max_px=1200):
-        """Downsampled overview per scene, for eyeballing seams before a long run."""
+        """Downsampled overview per scene, for eyeballing seams before a long run.
+
+        Returns [(plan, image, level)], the image decimated by 2**level. A plan with a
+        compositor is drawn by it, so registration and per-field flat-field show. A
+        plain `stitch_mode="metadata"` plan has none and is read through libCZI at the
+        same decimation: the stage-position composite that convert() will write.
+        """
         if not self.plans:
             self.plan()
+        ref = self._preview_plane()
         out = []
         for p in self.plans:
-            if p.compositor is None:
-                continue
-            ref = {"T": self.source.sel_t[0], "Z": self.source.sel_z[len(self.source.sel_z) // 2],
-                   "C": self.source.sel_c[0]}
-            img, lvl = p.compositor.preview(ref["T"], ref["Z"], ref["C"], max_px)
+            if p.compositor is not None:
+                img, lvl = p.compositor.preview(ref["T"], ref["Z"], ref["C"], max_px)
+            else:
+                x, y, w, h = p.rect
+                lvl = overview_level(w, h, max_px)
+                step = 1 << lvl
+                read = make_libczi_reader(self.source, p, lvl)
+                img = read(ref["T"], ref["Z"], ref["C"], x, y,
+                           (w // step) * step, (h // step) * step)
             out.append((p, img, lvl))
         return out
+
+    def tile_rects(self, plan):
+        """{m: (x, y, w, h)} mosaic tile positions, for outlining a preview.
+
+        Empty when there is nothing to outline (not a mosaic) or the positions cannot be
+        had. With a compositor they are the corrected positions it composites from. A
+        plain `metadata` plan never otherwise touches aicspylibczi, so there the outlines
+        are strictly optional: a missing package or an unreadable tile index costs the
+        outlines, says so, and leaves the overview itself alone.
+        """
+        if plan.compositor is not None:
+            return plan.compositor.rects
+        try:
+            if not self.source.aics().is_mosaic():
+                return {}
+            rects, _ = mosaic_geometry(self.source, plan.scene_id, self._preview_plane())
+        except ImportError:
+            self.log(f"[preview] {plan.label}: tile outlines need aicspylibczi "
+                     "(pip install aicspylibczi); showing the overview without them.")
+            return {}
+        except Exception as exc:
+            self.log(f"[preview] {plan.label}: tile positions unavailable for outlines "
+                     f"({type(exc).__name__}: {exc}); showing the overview without them.")
+            return {}
+        return rects
 
     def convert(self):
         if not self.plans:

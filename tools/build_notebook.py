@@ -233,7 +233,13 @@ plans = pipe.plan()
 md("""
 ## 4. Preview the stitching
 
-Only does anything when stitching. Look at the seams before committing to a long run.
+A downsampled overview of the middle Z plane (first selected channel) per scene, with the
+mosaic tiles outlined. Look at the seams before committing to a long run.
+
+Every `stitch_mode` draws one. In `metadata` mode it is libCZI's composite from the stage
+positions &mdash; the same pixels Convert will write &mdash; so this is the image to judge before
+deciding whether `refine` is worth it. The outlines there need aicspylibczi; without it
+the overview is shown bare.
 """)
 
 code(r'''
@@ -241,21 +247,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 previews = pipe.preview(max_px=1200)
-if previews:
-    fig, axes = plt.subplots(1, len(previews), figsize=(6 * len(previews), 6), squeeze=False)
-    for ax, (plan, img, lvl) in zip(axes[0], previews):
-        lo, hi = np.percentile(img, (1, 99.5))
-        ax.imshow(img, cmap="gray", vmin=lo, vmax=max(hi, lo + 1))
-        for mx, my, mw, mh in plan.compositor.rects.values():
-            s = 1 << lvl
-            ax.add_patch(plt.Rectangle(((mx - plan.rect[0]) / s, (my - plan.rect[1]) / s),
-                                       mw / s, mh / s, fill=False, ec="tab:orange",
-                                       lw=0.5, alpha=0.7))
-        ax.set_title(f"{plan.label}  (1/{1 << lvl})")
-        ax.axis("off")
-    plt.tight_layout(); plt.show()
-else:
-    print(f'stitch_mode = "{cfg.stitch_mode}": nothing to preview.')
+fig, axes = plt.subplots(1, len(previews), figsize=(6 * len(previews), 6), squeeze=False)
+for ax, (plan, img, lvl) in zip(axes[0], previews):
+    lo, hi = np.percentile(img, (1, 99.5))
+    hi = max(hi, lo + 1)
+    if img.ndim == 3:                  # RGB: imshow ignores vmin/vmax, so scale here
+        img = np.clip((img - lo) / (hi - lo), 0, 1)
+    ax.imshow(img, cmap="gray", vmin=lo, vmax=hi)
+    s = 1 << lvl
+    for mx, my, mw, mh in pipe.tile_rects(plan).values():
+        ax.add_patch(plt.Rectangle(((mx - plan.rect[0]) / s, (my - plan.rect[1]) / s),
+                                   mw / s, mh / s, fill=False, ec="tab:orange",
+                                   lw=0.5, alpha=0.7))
+    ax.set_title(f"{plan.label}  {cfg.stitch_mode}  (1/{s})")
+    ax.axis("off")
+plt.tight_layout(); plt.show()
 ''')
 
 md("""

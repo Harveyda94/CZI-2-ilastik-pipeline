@@ -88,7 +88,7 @@ Or step through it, which is what `convert_czi.ipynb` does:
 p = Pipeline(cfg)
 p.inspect()        # dimensions, metadata, RAM estimate
 p.plan()           # mosaic geometry, registration, intensity ranges
-p.preview()        # downsampled overview with tile outlines
+p.preview()        # downsampled overview per scene, in every stitch_mode
 p.benchmark()      # read vs convert vs compress; names the bottleneck
 p.convert()
 p.verify()

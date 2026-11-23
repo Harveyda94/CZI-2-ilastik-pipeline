@@ -15,6 +15,12 @@ from typing import Iterable, Sequence
 import numpy as np
 
 
+def overview_level(w, h, max_px):
+    """Smallest power-of-two decimation level that fits the longer side in `max_px`."""
+    longest = max(w, h)
+    return max(0, int(np.ceil(np.log2(longest / max_px)))) if longest > max_px else 0
+
+
 @dataclass
 class Tiler:
     tile: Sequence[int]                 # (height, width)

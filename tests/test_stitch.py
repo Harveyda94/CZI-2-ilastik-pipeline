@@ -380,3 +380,70 @@ def test_a_failed_decode_reaches_every_waiter_and_is_retried_afterwards(cfg):
     assert slow.counts == {0: 1}
     assert comp.tile(0, 0, 0, r[0], r[1], 64, 64, 0).shape == (64, 64)
     assert slow.counts == {0: 2}
+
+
+# ---------------------------------------------------------------- preview outlines
+class _Box:
+    def __init__(self, x, y, w, h):
+        self.x, self.y, self.w, self.h = x, y, w, h
+
+
+def _metadata_pipeline(cfg, tiles, meta, msgs):
+    """A plain `metadata` plan (no compositor) over a mosaic whose tile index is readable."""
+    from czipipe.pipeline import Pipeline
+    from czipipe.plan import ScenePlan
+
+    src = fake_source(cfg, tiles)
+    real = src.aics
+
+    def aics():
+        h = real()
+        h.get_mosaic_tile_bounding_box = lambda M, **kw: _Box(*meta[M])
+        return h
+
+    src.aics = aics
+    p = Pipeline(cfg, log=msgs.append)
+    plan = ScenePlan(None, src.rect, {})
+    p.source, p.plans = src, [plan]
+    return p, plan
+
+
+def test_metadata_preview_outlines_are_the_stage_positions(cfg):
+    gt, tiles, meta = make_mosaic()
+    msgs = []
+    p, plan = _metadata_pipeline(cfg, tiles, meta, msgs)
+    assert p.tile_rects(plan) == meta
+    assert not msgs
+
+
+def test_outlines_follow_the_compositor_when_there_is_one(cfg):
+    """With registration the outlines must be where the tiles were actually placed."""
+    gt, tiles, meta = make_mosaic()
+    p, plan = _metadata_pipeline(cfg, tiles, meta, [])
+    plan.compositor = MosaicCompositor(p.source, cfg, None, meta, PERT)
+    assert p.tile_rects(plan) is plan.compositor.rects
+    assert p.tile_rects(plan) != meta
+
+
+def test_missing_aicspylibczi_costs_the_outlines_not_the_preview(cfg):
+    """Plain `metadata` conversion never needs aicspylibczi; neither may its preview."""
+    gt, tiles, meta = make_mosaic()
+    msgs = []
+    p, plan = _metadata_pipeline(cfg, tiles, meta, msgs)
+
+    def no_aics():
+        raise ImportError("No module named 'aicspylibczi'")
+
+    p.source.aics = no_aics
+    assert p.tile_rects(plan) == {}
+    assert len(msgs) == 1 and "pip install aicspylibczi" in msgs[0]
+    [(_, img, lvl)] = p.preview(max_px=1200)
+    assert img.shape == (640, 640) and lvl == 0
+
+
+def test_an_unreadable_tile_index_is_reported_not_raised(cfg):
+    gt, tiles, meta = make_mosaic()
+    msgs = []
+    p, plan = _metadata_pipeline(cfg, tiles, {}, msgs)     # no tile resolves
+    assert p.tile_rects(plan) == {}
+    assert len(msgs) == 1 and "No mosaic tiles found" in msgs[0]

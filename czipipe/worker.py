@@ -2,7 +2,8 @@
 
 One factory, two paths: libCZI ROI reads for `stitch_mode="metadata"`, the mosaic
 compositor otherwise. Both return a tile already cast to the output dtype and padded to
-exactly the tile shape, so writers never need to know which was used.
+exactly the tile shape, so writers never need to know which was used. The libCZI read
+itself is `make_libczi_reader`, which the stitching preview shares.
 """
 
 from __future__ import annotations
@@ -41,6 +42,23 @@ def make_worker(source, cfg, backend, tiler, plan, level=0):
             return tiler.fit(convert(comp.tile(t, z, c, x, y, w, h, level), c))
         return work
 
+    read = make_libczi_reader(source, plan, level)
+
+    def work(task):
+        t, z, c, x, y, w, h = task
+        return tiler.fit(convert(read(t, z, c, x, y, w, h), c))
+
+    return work
+
+
+def make_libczi_reader(source, plan, level=0):
+    """Region reads through libCZI's own compositor, the `stitch_mode="metadata"` path.
+
+    Returns `read(t, z, c, x, y, w, h)`: the full-resolution region decimated by
+    2**level, in the source dtype, with any single-field flat-field applied. The tile
+    worker and `Pipeline.preview()` both read through this, so the overview shows the
+    pixels the conversion writes.
+    """
     zoom = 1.0 / (1 << level)
     kw = source.read_kwargs(plan.scene_id)
     samples = source.samples
@@ -48,8 +66,7 @@ def make_worker(source, cfg, backend, tiler, plan, level=0):
     ox, oy = plan.rect[0], plan.rect[1]
     ffs = plan.flatfields or {}
 
-    def work(task):
-        t, z, c, x, y, w, h = task
+    def read(t, z, c, x, y, w, h):
         # background_pixel is deliberately not passed: some pylibCZIrw builds call
         # Color(*background_pixel) unconditionally, so a scalar raises TypeError even
         # for Gray pixel types. The default is already black.
@@ -69,6 +86,6 @@ def make_worker(source, cfg, backend, tiler, plan, level=0):
             # clipped at 0 after dark subtraction) so writers see the dtype they declared
             # and the 8-bit "shift" method still has integers to shift.
             arr = cast_to(ff.apply(arr, ys, xs), source.dtype)
-        return tiler.fit(convert(arr, c))
+        return arr
 
-    return work
+    return read
