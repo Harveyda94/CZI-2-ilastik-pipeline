@@ -8,6 +8,33 @@ converts on a laptop.
 
 ## Install
 
+You need [conda](https://docs.conda.io/en/latest/miniconda.html) and
+[git](https://git-scm.com/downloads). Then, in a terminal (Anaconda Prompt on Windows):
+
+```bash
+git clone https://github.com/Harveyda94/CZI-2-ilastik-pipeline.git
+cd CZI-2-ilastik-pipeline
+conda create -n czipipe python=3.12 -y
+conda activate czipipe
+pip install -e ".[stitch,hdf5,ilastik]" ipykernel
+python -m ipykernel install --user --name czipipe --display-name "Python 3.12 (czipipe)"
+```
+
+Open `convert_czi.ipynb` from that folder and choose the **Python 3.12 (czipipe)**
+kernel. Add `flatfield` to the extras for `flatfield.mode "basic"`, or `gpu` for NVIDIA
+CUDA 12 (e.g. `".[stitch,hdf5,ilastik,flatfield]"`). To update later, run `git pull`
+in the folder.
+
+To call czipipe from your own scripts without the notebook, one command is enough:
+
+```bash
+pip install "czipipe[stitch,hdf5,ilastik] @ git+https://github.com/Harveyda94/CZI-2-ilastik-pipeline.git"
+```
+
+## Dependencies
+
+What each package is for, if you would rather install them individually:
+
 ```bash
 pip install pylibCZIrw tifffile imagecodecs numpy tqdm h5py matplotlib scipy psutil
 pip install aicspylibczi      # stitch_mode "refine" / "bigstitcher", and flat-field on mosaics
