@@ -156,8 +156,8 @@ def with_proposals(monkeypatch, change):
     """Make phase correlation propose `change(dy, dx, dz)` instead of what it found."""
     real = refine3d.peaks
 
-    def wrong(backend, a, b, n=refine3d.PEAKS):
-        shifts, sharp = real(backend, a, b, n)
+    def wrong(backend, a, b, n=refine3d.PEAKS, workers=1):
+        shifts, sharp = real(backend, a, b, n, workers)
         return [change(*s) for s in shifts], sharp
 
     monkeypatch.setattr(refine3d, "peaks", wrong)
@@ -207,7 +207,7 @@ def test_a_walk_that_never_settles_is_rejected(cfg3, monkeypatch):
     Keeping wherever the walk had got to would be a guess with a good score."""
     real = refine3d.peaks
 
-    def three_planes_off(backend, a, b, n=refine3d.PEAKS):
+    def three_planes_off(backend, a, b, n=refine3d.PEAKS, workers=1):
         (dy, dx, dz), sharp = real(backend, a, b, 1)[0][0], 1.0
         return [(dy, dx, dz + 3)], sharp
 
@@ -318,9 +318,10 @@ def test_one_displaced_tile_moves_alone(cfg3):
 def test_solve_does_not_compound_error():
     ms = [0, 1, 2]
     edges = [(0, 1, (10, 0, 1), 1.0), (1, 2, (10, 0, 1), 1.0), (0, 2, (18, 0, 2), 1.0)]
-    corr, rms, rms_z, orphans = refine3d.solve(ms, edges)
+    corr, rms, rms_z, orphans, apart, dropped = refine3d.solve(ms, edges)
     assert orphans == [] and corr[0][:2] == (0, 0)
     assert 18 <= corr[2][0] <= 20 and rms > 0 and rms_z == 0
+    assert dropped == [] and max(abs(v) for d in apart for v in d) <= 1
 
 
 def test_z_keeps_the_median_tile_on_its_own_planes():
@@ -336,15 +337,133 @@ def test_a_group_not_joined_to_the_first_tile_keeps_its_median_in_place():
     ms = [0, 1, 2, 3, 4, 5]
     edges = [(0, 1, (2, 0, 0), 1.0),
              (3, 4, (0, 6, 1), 1.0), (4, 5, (0, 6, 1), 1.0)]
-    corr, _, _, orphans = refine3d.solve(ms, edges)
+    corr, _, _, orphans, _, _ = refine3d.solve(ms, edges)
     assert corr[0] == (0, 0, 0) and corr[1] == (2, 0, 0)
     assert orphans == [2] and corr[2] == (0, 0, 0)
     assert [corr[m] for m in (3, 4, 5)] == [(0, -6, -1), (0, 0, 0), (0, 6, 1)]
 
 
 def test_no_accepted_pair_leaves_everything_at_metadata():
-    corr, rms, rms_z, orphans = refine3d.solve([0, 1], [])
+    corr, rms, rms_z, orphans, apart, dropped = refine3d.solve([0, 1], [])
     assert corr == {0: (0, 0, 0), 1: (0, 0, 0)} and rms is None and orphans == [0, 1]
+    assert apart == [] and dropped == []
+
+
+# ---------------------------------------------------------------- pairs that are wrong
+GRID = {0: (0, 0, 0), 1: (3, -4, 1), 2: (-2, 5, -1), 3: (4, 2, 0)}       # a 2 x 2 mosaic
+LINKS = [(0, 1), (0, 2), (1, 3), (2, 3), (0, 3), (1, 2)]
+
+
+def links(wrong=None, weight=1.0):
+    """Every pair of the 2 x 2 mosaic measured exactly, bar those in `wrong`, which are
+    out by the amount given."""
+    out = []
+    for i, j in LINKS:
+        s = tuple(b - a for a, b in zip(GRID[i], GRID[j]))
+        if wrong and (i, j) in wrong:
+            s = tuple(a + b for a, b in zip(s, wrong[(i, j)]))
+        out.append((i, j, s, weight))
+    return out
+
+
+def test_one_wrong_pair_does_not_move_the_tiles_the_others_agree_on():
+    """Found on a real stack: two pairs out by 20 px, among twelve that agreed to within a
+    few, pulled four tiles 6 px with them. Plain least squares shares a wrong
+    measurement out among every tile it touches."""
+    corr, rms, rms_z, orphans, apart, dropped = refine3d.solve(
+        [0, 1, 2, 3], links({(1, 3): (20, -6, 0)}))
+    assert corr == GRID and dropped == [2] and orphans == []
+    assert apart[2] == (-20, 6, 0) and rms == rms_z == 0        # of the five in the fit
+
+
+def test_a_pair_wrong_along_z_is_left_out_too():
+    corr, *_, apart, dropped = refine3d.solve([0, 1, 2, 3], links({(0, 3): (0, 0, 3)}))
+    assert corr == GRID and dropped == [4] and apart[4] == (0, 0, -3)
+
+
+def mosaic_links(wrong=None):
+    """All 20 pairs of the 3 x 3 mosaic measured exactly, bar those in `wrong`."""
+    pairs = [(c["i"], c["j"]) for c in refine3d.candidates(
+        {m: (x, y, TS, TS) for m, (x, y) in POSITIONS.items()}, 32, 100)]
+    out = []
+    for i, j in pairs:
+        s = tuple(b - a for a, b in zip(PERT3[i], PERT3[j]))
+        if wrong and (i, j) in wrong:
+            s = tuple(a + b for a, b in zip(s, wrong[(i, j)]))
+        out.append((i, j, s, 1.0))
+    return pairs, out
+
+
+def test_two_wrong_pairs_go_one_at_a_time():
+    """As on the real stack: two of twenty out by 20 px or so, the rest agreeing."""
+    pairs, edges = mosaic_links({(1, 4): (20, 6, 0), (6, 7): (-24, 5, 2)})
+    corr, rms, rms_z, _, apart, dropped = refine3d.solve(sorted(POSITIONS), edges)
+    assert corr == PERT3 and rms == rms_z == 0
+    assert sorted(pairs[k] for k in dropped) == [(1, 4), (6, 7)]
+    assert apart[pairs.index((6, 7))] == (24, -5, -2)
+
+
+def test_two_wrong_pairs_in_six_cannot_be_told_apart():
+    """With a third of the measurements wrong and every tile touched by one, there is no
+    agreeing majority, and nothing is left out: the fit is the least-squares compromise."""
+    *_, dropped = refine3d.solve([0, 1, 2, 3], links({(1, 3): (20, 0, 0), (0, 2): (-24, 5, 2)}))
+    assert dropped == []
+
+
+def test_a_tiles_only_link_is_never_left_out():
+    """Nothing contradicts it, so there is nothing for it to be far from."""
+    chain = [(0, 1, (50, 0, 0), 1.0), (1, 2, (-70, 30, 4), 1.0), (2, 3, (9, 9, -5), 1.0)]
+    corr, rms, rms_z, _, apart, dropped = refine3d.solve([0, 1, 2, 3], chain)
+    assert dropped == [] and rms == rms_z == 0
+    assert corr[3][:2] == (-11, 39)
+
+
+def test_pairs_that_all_disagree_a_little_all_stay():
+    """Tissue that moved between tiles leaves every pair a few pixels from any fit.
+    There is no agreeing majority to side with, and leaving pairs out until the rest
+    agreed would keep whichever few happened to."""
+    scatter = {(0, 1): (5, -4, 0), (0, 2): (-5, 3, 1), (1, 3): (4, 5, -1),
+               (2, 3): (-4, -5, 0), (0, 3): (5, 5, 1), (1, 2): (-5, 4, -1)}
+    corr, rms, _, _, apart, dropped = refine3d.solve([0, 1, 2, 3], links(scatter))
+    assert dropped == [] and rms > 3
+    assert max(abs(a - b) for m in GRID for a, b in zip(corr[m], GRID[m])) <= 4
+
+
+def test_one_route_against_one_pair_is_settled_by_weight_not_by_leaving_out():
+    """Three tiles in a ring: against any one pair there is only the other two, taken
+    together, so none can be called wrong. Each counts for as much as it matched."""
+    ring = [(0, 1, (10, 0, 0), 1.0), (1, 2, (10, 0, 0), 1.0), (0, 2, (40, 0, 0), 1.0)]
+    corr, *_, dropped = refine3d.solve([0, 1, 2], ring)
+    assert dropped == [] and corr[2] == (33, 0, 0)        # 20 px shared out three ways
+    ring[2] = (0, 2, (40, 0, 0), 0.05)                    # a far weaker match
+    corr, *_, dropped = refine3d.solve([0, 1, 2], ring)
+    assert dropped == [] and corr[2] == (20, 0, 0)
+
+
+def test_a_wrong_measurement_is_left_out_of_the_mosaic(cfg3, monkeypatch):
+    """Through the registration itself: one pair made to report a confident wrong shift."""
+    real = refine3d.measure
+
+    def one_pair_wrong(backend, rc, max_z, c, va, vb, workers=1):
+        o = real(backend, rc, max_z, c, va, vb, workers)
+        if (c["i"], c["j"]) == (4, 5):
+            o["shift"] = (o["shift"][0] + 25, o["shift"][1] - 9, o["shift"][2] + 2)
+            o["got"] = o["at"][o["shift"]] = 0.9
+        return o
+
+    monkeypatch.setattr(refine3d, "measure", one_pair_wrong)
+    gt, tiles, meta = make_mosaic()
+    corr, log = register(cfg3, tiles, meta)
+    assert corr == PERT3
+    assert log["left_out_of_fit"] == [[4, 5]] and log["left_out_by"] == [25, 2]
+    wrong = next(p for p in log["pairs"] if (p["i"], p["j"]) == (4, 5))
+    assert wrong["accepted"] and wrong["left_out_of_fit"] and wrong["from_fit"] == [-25, 9, -2]
+    assert sum(p.get("left_out_of_fit", False) for p in log["pairs"]) == 1
+    assert log["rms_residual_px"] == 0
+    report = refine3d.format_report(log)
+    assert "20/20 pairs accepted, RMS residual 0.00 px, 0.00 planes in Z over the 19 in the fit" in report
+    assert "[warn] 1 accepted pair(s) left out of the fit (4-5): up to 25 px / 2 planes" in report
+    json.dumps(log)
 
 
 # ---------------------------------------------------------------- slabs
@@ -470,8 +589,10 @@ def test_batches_bound_memory_without_changing_the_answer(cfg3):
         return corr, log, counting.reads
 
     whole, log_whole, reads_whole = run(768)
-    split, log_split, reads_split = run(4)
+    split, log_split, reads_split = run(12)
     assert whole == split == PERT3
+    assert log_whole.pop("memory")["batches_per_slab"] == 1
+    assert log_split.pop("memory")["batches_per_slab"] > 1
     assert json.dumps(log_whole, sort_keys=True) == json.dumps(log_split, sort_keys=True)
     assert reads_whole == len(POSITIONS) * NZ               # every tile, once per plane
     assert reads_whole < reads_split < len(log_whole["pairs"]) * 2 * NZ
@@ -493,9 +614,110 @@ def test_threads_do_not_change_the_answer(cfg3):
     for n in (1, 2, 8):
         cfg3.n_read_threads = n
         corr, log = register(cfg3, tiles, meta)
-        assert corr == PERT3
+        assert corr == PERT3 and log.pop("memory")["threads"] == n
         logs.append(json.dumps(log, sort_keys=True))
     assert logs[0] == logs[1] == logs[2]
+
+
+# ---------------------------------------------------------------- the run's settings
+def test_the_transform_runs_on_the_runs_threads_not_the_machines(cfg3, monkeypatch):
+    """It used to ask scipy for every CPU on the machine, whatever n_read_threads said
+    and whatever a container or scheduler allowed the process."""
+    try:
+        import scipy.fft as sfft
+    except ImportError:
+        pytest.skip("scipy not installed")
+    asked = []
+
+    def recording(real):
+        def call(*a, **kw):
+            asked.append(kw.get("workers"))
+            return real(*a, **kw)
+        return call
+
+    monkeypatch.setattr(sfft, "rfftn", recording(sfft.rfftn))
+    monkeypatch.setattr(sfft, "irfftn", recording(sfft.irfftn))
+    gt, tiles, meta = make_mosaic()
+    for n in (1, 3):
+        asked.clear()
+        cfg3.n_read_threads = n
+        corr, _ = register(cfg3, tiles, meta)
+        assert corr == PERT3 and asked and set(asked) == {n}
+
+
+def test_registration_memory_fits_the_cache_setting(cfg3):
+    """Overlap volumes and working memory together, not the volumes alone: the transform
+    and the scoring used to come on top of the cap, set by nothing and reported nowhere."""
+    gt, tiles, meta = make_mosaic()
+
+    def run(mb):
+        cfg3.mosaic_cache_mb = mb
+        corr, log = register(cfg3, tiles, meta)
+        assert corr == PERT3
+        return log["memory"], refine3d.format_report(log)
+
+    m, report = run(768)
+    assert m["budget_mb"] == 768 and m["batches_per_slab"] == 1 and m["threads"] == 4
+    assert m["peak_mb"] <= 768 and abs(m["peak_mb"] - m["volumes_mb"] - m["working_mb"]) <= 1
+    assert f"up to {m['peak_mb']} MB" in report and "within mosaic_cache_mb = 768" in report
+
+    m, report = run(12)                           # room for a few pairs at a time
+    assert m["peak_mb"] <= 12 and m["batches_per_slab"] > 1
+    assert "batches a slab" in report and "[warn]" not in report
+
+    m, report = run(4)                            # less than one pair and one transform
+    assert m["peak_mb"] > 4 and m["batches_per_slab"] == 20
+    assert "[warn] that is over mosaic_cache_mb = 4" in report
+
+
+def test_the_memory_it_reports_is_what_it_uses(cfg3):
+    """The figure in the report is a ceiling the registration has to stay under, so it is
+    checked against what numpy actually allocated."""
+    import tracemalloc
+
+    gt, tiles, meta = make_mosaic()
+    src = source(cfg3, tiles)
+    register(cfg3, tiles, meta)                               # imports, FFT plans
+    tracemalloc.start()
+    try:
+        base = tracemalloc.get_traced_memory()[0]
+        tracemalloc.reset_peak()
+        _, log = refine3d.register(src, cfg3, Backend(False), None, meta,
+                                   {"T": 0, "Z": NZ // 2, "C": 0})
+        used = (tracemalloc.get_traced_memory()[1] - base) / 1e6
+    finally:
+        tracemalloc.stop()
+    m = log["memory"]
+    assert m["volumes_mb"] < used <= m["peak_mb"], (used, m)
+
+
+def test_threads_give_way_to_memory_for_very_large_tiles():
+    """Each thread holds a whole tile while it is read. Thirty-two 4096 px tiles at once
+    would be more than the cap on their own, so fewer threads are used."""
+    plan = refine3d.working_plan
+    assert plan([], 2 * 1920 * 1920, 16, 2, 32, 768e6)[0] == 32
+    assert plan([], 2 * 4096 * 4096, 16, 2, 32, 768e6)[0] == 11
+    assert plan([], 2 * 4096 * 4096, 16, 2, 32, 16e6)[0] == 1
+    rects = {m: (x, y, 1920, 1920) for m, (x, y) in
+             enumerate((x, y) for y in (0, 1728) for x in (0, 1728, 3456))}
+    cands = refine3d.candidates(rects, 32, 100)
+    for c in cands:
+        c["step"] = refine3d.score_step(c["overlap"][0] * c["overlap"][1] * 16)
+    threads, room, m = plan(cands, 2 * 1920 * 1920, 16, 2, 8, 768e6)
+    assert (threads, m["batches_per_slab"]) == (8, 1)
+    assert m == {"budget_mb": 768, "threads": 8, "working_mb": 112, "volumes_mb": 273,
+                 "peak_mb": 385, "batches_per_slab": 1}
+
+
+def test_volume_ncc_is_the_ncc():
+    rng = np.random.default_rng(2)
+    a = rng.integers(0, 60000, (7, 90, 110)).astype(np.uint16)
+    b = (0.6 * a + rng.normal(0, 9000, a.shape)).clip(0, 65535).astype(np.uint16)
+    assert refine3d.volume_ncc(a, b) == pytest.approx(refine.ncc(a, b), abs=1e-6)
+    assert refine3d.volume_ncc(a[:, ::2, 1::3], b[:, ::2, 1::3]) == pytest.approx(
+        refine.ncc(a[:, ::2, 1::3], b[:, ::2, 1::3]), abs=1e-6)
+    assert refine3d.volume_ncc(a, np.full_like(a, 7)) == 0.0          # nothing to match
+    assert refine3d.volume_ncc(a[:0], b[:0]) == 0.0
 
 
 def test_a_large_overlap_is_scored_on_a_lattice():

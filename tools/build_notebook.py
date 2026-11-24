@@ -246,7 +246,9 @@ If `stitch_mode` is `refine`, three things to read appear here:
 With `cfg.refine.mode = "3d"` the same report gains a Z part: the range of **Z
 corrections** (in planes, relative to the median tile), the Z residual, and a `[note]`
 listing any output planes that lack some tiles because their Z offset reaches past the
-end of the stack. The depth check is then per slab of planes rather than per plane.
+end of the stack. The depth check is then per slab of planes rather than per plane. A
+`[warn]` naming pairs **left out of the fit** means those measurements disagreed with
+the rest by several pixels or planes and were not used to place the tiles.
 """)
 
 code(r'''
@@ -409,9 +411,11 @@ correlates each overlap as a volume and gives every tile a Z correction as well,
 whole planes; each tile is then taken from the plane that belongs at the one being
 written. It reads far more of the file to register (every tile once per plane of every
 slab), and the first and last few output planes can lack the tiles whose offset reaches
-past the end of the stack. It is tested on real CZI files, but only ones written from
-synthetic volumes, so on microscope data check the preview at a few depths before a
-long run.
+past the end of the stack. It uses the same threads and memory cap as the rest of the
+run, and the plan output states what it used. It has been run on real z-stacks cut into
+tiles, but not yet on a tiled acquisition, so check the preview at a few depths before a
+long run, and take its warnings seriously: a pair left out of the fit, a high residual
+or a depth warning each mean some seam will not line up.
 
 **Flat-field correction is per field of view**, so it only works where individual fields
 are still separable. On a mosaic that means the per-tile path: `refine`, `bigstitcher`,

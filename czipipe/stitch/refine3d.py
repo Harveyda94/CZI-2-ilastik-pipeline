@@ -21,10 +21,13 @@ the same Z offset without it. A pair the stage already has right says so too: wh
 best match is at no shift at all, that is kept as a (weak) constraint rather than thrown
 away.
 
-Memory stays bounded. A measurement needs only the overlap of its two tiles, over one
-slab, and pairs are measured in batches whose volumes fit `mosaic_cache_mb` together.
-Tiles are read and pairs measured on the run's read threads, with one volume transform
-running at a time.
+It keeps to the run's settings. A measurement needs only the overlap of its two tiles,
+over one slab, and pairs are measured in batches sized so that their volumes and the
+working memory together fit `mosaic_cache_mb`. Tiles are read, pairs measured and the
+volume transform run on the run's read threads and no others, one transform at a time.
+
+Tiles are placed by one least-squares fit over the accepted pairs, from which pairs that
+plainly contradict the rest are left out, and named in the report.
 
 It is still one translation per tile. Several slabs are measured so that one featureless
 depth does not lose a pair, and the report says where slabs disagree, but a tile that is
@@ -37,7 +40,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from .refine import choose, ncc, overlap_slices
+from ..compute import VOLUME_BYTES_PER_VOXEL
+from .refine import choose, overlap_slices
 
 PEAKS = 5             # distinct correlation peaks tried per measurement, strongest first
 SUPPRESS = 2          # voxels either side of a peak in which the next is not sought
@@ -46,6 +50,9 @@ STEPS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
 SCORE_VOXELS = 1_000_000    # an NCC over this many samples is settled; a larger overlap
                             # is scored on a lattice holding at least this many
 AGREE = 1             # shifts are integers, so a true half-step reads as either side
+OUTLIER_PX = 3.5      # a pair this far in XY from where the others put its two tiles,
+OUTLIER_PLANES = 1.5  # or this far along Z, is a candidate for leaving out of the fit
+OUTLIER_RATIO = 4.0   # if it is also this many times further out than the typical pair
 MIN_DEPTH = 3         # planes in a slab; fewer cannot tell a Z offset from none
 ZERO = (0, 0, 0)
 
@@ -158,9 +165,9 @@ def load(read, slab, batch, dtype, pool=None, progress=None):
 
 
 # ---------------------------------------------------------------- one measurement
-def peaks(backend, a, b, n=PEAKS):
+def peaks(backend, a, b, n=PEAKS, workers=1):
     """Up to `n` distinct phase-correlation peaks as shifts, strongest first, and a
-    peak-sharpness score.
+    peak-sharpness score. The transform runs on `workers` threads.
 
     A shift s = (dy, dx, dz) means b[k, i, j] ~ a[k + dz, i + dy, j + dx]: it is how far
     tile b has to move, in pixels and planes, to line up with tile a. XY first, so that
@@ -170,7 +177,7 @@ def peaks(backend, a, b, n=PEAKS):
     is sought: the list is `n` different hypotheses, not one peak and its shoulders.
     Where exactly a peak's best match lies is settled by NCC, in `measure`.
     """
-    cc = backend.fft_phase_correlation(a, b)
+    cc = backend.fft_phase_correlation(a, b, workers=workers)
     floor = float(np.abs(cc).mean())
     out, top = [], None
     for _ in range(n):
@@ -200,6 +207,31 @@ def score_step(voxels):
     return step
 
 
+def volume_ncc(a, b):
+    """NCC of two volumes of one shape, summed a plane at a time.
+
+    Copying both volumes whole to subtract their means, as `refine.ncc` does for a plane,
+    costs tens of MB a call for a slab, and with a thread to a pair, per thread. Here the
+    sums are built up plane by plane in double precision, so a call holds two planes of
+    what it is scoring. No BLAS: its thread pool would be one more that no setting sizes.
+    """
+    n = 0
+    sa = sb = saa = sbb = sab = 0.0
+    for pa, pb in zip(a, b):
+        pa = np.ascontiguousarray(pa, np.float64).ravel()
+        pb = np.ascontiguousarray(pb, np.float64).ravel()
+        n += pa.size
+        sa += float(pa.sum())
+        sb += float(pb.sum())
+        saa += float(np.einsum("i,i->", pa, pa))
+        sbb += float(np.einsum("i,i->", pb, pb))
+        sab += float(np.einsum("i,i->", pa, pb))
+    if not n:
+        return 0.0
+    var = (saa - sa * sa / n) * (sbb - sb * sb / n)
+    return (sab - sa * sb / n) / var ** 0.5 if var > 1e-9 else 0.0
+
+
 def score(c, va, vb, s):
     """NCC of the pair's volumes with tile j moved by s, over everything they then share.
 
@@ -222,10 +254,10 @@ def score(c, va, vb, s):
             return 0.0
         ya, yb = slice(ya.start + oy, ya.stop, step), slice(yb.start + oy, yb.stop, step)
         xa, xb = slice(xa.start + ox, xa.stop, step), slice(xb.start + ox, xb.stop, step)
-    return ncc(va[slice(lo + s[2], hi + s[2]), ya, xa], vb[slice(lo, hi), yb, xb])
+    return volume_ncc(va[slice(lo + s[2], hi + s[2]), ya, xa], vb[slice(lo, hi), yb, xb])
 
 
-def measure(backend, rc, max_z, c, va, vb):
+def measure(backend, rc, max_z, c, va, vb, workers=1):
     """One pair in one slab: the shift it supports, and how that scores against metadata.
 
     Phase correlation only proposes, and NCC decides. The best-matching proposal (one of
@@ -246,7 +278,8 @@ def measure(backend, rc, max_z, c, va, vb):
     than none.
     """
     whole = (slice(None),)
-    found, sharp = peaks(backend, va[whole + c["core"][0]], vb[whole + c["core"][1]])
+    found, sharp = peaks(backend, va[whole + c["core"][0]], vb[whole + c["core"][1]],
+                         workers=workers)
     at = {}
 
     def ncc_at(p):
@@ -337,11 +370,71 @@ def _lower_median(values):
     return sorted(int(v) for v in values)[(len(values) - 1) // 2]
 
 
+def _fit(A, rhs, wts, keep):
+    """Weighted least squares on the pairs in `keep`: the solution, every pair's residual,
+    and how far each kept pair is from where the *other* pairs put its two tiles, in
+    units of the outlier thresholds.
+
+    That last is the residual divided by (1 - leverage): what the residual would be had
+    the pair not been in the fit pulling it towards itself. A pair that is a tile's only
+    link has leverage 1 and nothing to be compared with, so it counts as no distance.
+    """
+    w = (wts * keep)[:, None]
+    pinv = np.linalg.pinv(A * w)
+    x = pinv @ (rhs * w)
+    r = A @ x - rhs
+    free = 1.0 - np.einsum("ij,ji->i", A * w, pinv)
+    apart = np.abs(r) / np.where(free > 1e-9, free, np.inf)[:, None]
+    far = np.maximum(apart[:, :2].max(axis=1) / OUTLIER_PX, apart[:, 2] / OUTLIER_PLANES)
+    return x, r, np.where(keep, far, 0.0)
+
+
+def _two_ways(links, a, b):
+    """Are tiles `a` and `b` joined by two routes through `links` that share no pair?
+
+    If they are, no single pair holds them together, and (Menger) the converse: so it
+    is enough to find one route and see whether losing any one pair on it parts them.
+    """
+    def route(without=None):
+        seen, queue = {a: None}, [a]
+        for node in queue:
+            for k, (i, j) in enumerate(links):
+                if k == without or node not in (i, j):
+                    continue
+                other = j if node == i else i
+                if other not in seen:
+                    seen[other] = (node, k)
+                    queue.append(other)
+        if b not in seen:
+            return None
+        path, node = [], b
+        while seen[node] is not None:
+            node, k = seen[node]
+            path.append(k)
+        return path
+
+    first = route()
+    return first is not None and all(route(k) is not None for k in first)
+
+
 def solve(ms, edges):
     """Weighted least squares over the tile graph: (dy, dx, dz) per tile.
 
-    All constraints at once, so error does not compound across the mosaic. What no
-    measurement can fix is where each connected group of tiles sits as a whole:
+    All constraints at once, so error does not compound across the mosaic. Least squares
+    on its own shares a wrong measurement out among every tile it touches, however many
+    other pairs agree with each other, so pairs that are plainly wrong are left out and
+    the fit redone. A pair is left out, the furthest first, when all of these hold:
+
+    - it is more than OUTLIER_PX, or OUTLIER_PLANES along Z, from where the other pairs
+      put its two tiles;
+    - without it those two tiles are still joined by two separate routes, so that what
+      contradicts it is more than one other measurement's word against its own;
+    - it is more than OUTLIER_RATIO times as far out as the typical pair is once it has
+      gone. That is what stops a mosaic whose pairs all disagree a little, as when the
+      tissue moved between tiles, from being whittled down to the few that happen to
+      agree.
+
+    What no measurement can fix is where each connected group of tiles sits as a whole:
 
     - In XY the group holding the first tile is pinned there, as in 2D. Any other group
       keeps its median tile where the stage put it.
@@ -350,10 +443,12 @@ def solve(ms, edges):
       others, so the choice that moves the fewest tiles along Z also loses the least.
 
     Tiles with no accepted pair keep their metadata position. Returns the corrections,
-    the RMS residual in XY (px) and in Z (planes), and those unconstrained tiles.
+    the RMS residual of the pairs in the fit in XY (px) and in Z (planes), the
+    unconstrained tiles, every pair's distance from the fit as (dy, dx, dz), and the
+    indices of the pairs left out of it.
     """
     if not edges:
-        return {m: (0, 0, 0) for m in ms}, None, None, list(ms)
+        return {m: (0, 0, 0) for m in ms}, None, None, list(ms), [], []
     idx = {m: k for k, m in enumerate(ms)}
     A = np.zeros((len(edges), len(ms)), np.float64)
     rhs = np.zeros((len(edges), 3), np.float64)
@@ -362,7 +457,27 @@ def solve(ms, edges):
         A[k, idx[mi]], A[k, idx[mj]] = -1.0, 1.0
         rhs[k] = s
         wts[k] = w
-    x, *_ = np.linalg.lstsq(A * wts[:, None], rhs * wts[:, None], rcond=None)
+
+    keep = np.ones(len(edges), bool)
+    x, r, far = _fit(A, rhs, wts, keep)
+    while True:
+        for worst in np.argsort(-far):
+            if far[worst] <= 1.0:
+                worst = None                     # nothing left that is far out
+                break
+            rest = keep.copy()
+            rest[worst] = False
+            links = [e[:2] for e, kept in zip(edges, rest) if kept]
+            if not _two_ways(links, *edges[worst][:2]):
+                continue
+            trial = _fit(A, rhs, wts, rest)
+            if far[worst] > OUTLIER_RATIO * float(np.median(trial[2][rest])):
+                break
+        else:
+            worst = None
+        if worst is None:
+            break
+        keep, (x, r, far) = rest, trial
 
     sol = np.zeros((len(ms), 3), int)
     for g in _groups(ms, edges):
@@ -377,9 +492,11 @@ def solve(ms, edges):
     r = A @ sol - rhs
     linked = {m for e in edges for m in e[:2]}
     return ({m: tuple(int(v) for v in sol[idx[m]]) for m in ms},
-            float(np.sqrt((r[:, :2] ** 2).sum(axis=1).mean())),
-            float(np.sqrt((r[:, 2] ** 2).mean())),
-            [m for m in ms if m not in linked])
+            float(np.sqrt((r[keep, :2] ** 2).sum(axis=1).mean())),
+            float(np.sqrt((r[keep, 2] ** 2).mean())),
+            [m for m in ms if m not in linked],
+            [tuple(int(v) for v in row) for row in np.rint(r)],
+            [int(k) for k in np.flatnonzero(~keep)])
 
 
 def incomplete_planes(sel_z, corr, z_range):
@@ -393,6 +510,40 @@ def incomplete_planes(sel_z, corr, z_range):
         return []
     return [int(z) for z in sel_z
             if any(not z_range[0] <= z - dz < z_range[1] for dz in shifts)]
+
+
+# ---------------------------------------------------------------- threads and memory
+def working_plan(cands, tile_bytes, depth, itemsize, threads, budget):
+    """How many threads to use, and how many bytes that leaves for overlap volumes.
+
+    Registration has `budget` bytes in all (`mosaic_cache_mb`: the compositor's cache,
+    which is empty until registration is over). Three things draw on it besides the
+    volumes themselves:
+
+    - whole tiles while they are read and cut, one per thread;
+    - one volume transform, VOLUME_BYTES_PER_VOXEL for each voxel of the largest overlap;
+    - two planes of what is being scored, in double precision, per thread.
+
+    The first is capped at half the budget by using fewer threads than the run has, which
+    only matters for very large tiles. Reading and measuring do not happen at once, so
+    the working memory is the larger of the two, and the volumes get what remains. If
+    that is less than one pair's volumes the pair is still measured, on its own: then the
+    registration needs more than the budget, and the report says how much.
+    """
+    threads = max(1, min(int(threads), int(budget / 2 // max(tile_bytes, 1)) or 1))
+    core = max((c["overlap"][0] * c["overlap"][1] for c in cands), default=0) * depth
+    plane = max((max(r[2] * r[3] for r in c["rects"]) // c.get("step", 1) ** 2
+                 for c in cands), default=0)
+    working = max(threads * tile_bytes,
+                  VOLUME_BYTES_PER_VOXEL * core + threads * 2 * 8 * plane)
+    room = max(budget - working, 0)
+    largest = max((sum(c["area"] for c in run) * depth * itemsize
+                   for run in batches(cands, depth, itemsize, room)), default=0)
+    return threads, room, {"budget_mb": round(budget / 1e6), "threads": threads,
+                           "working_mb": round(working / 1e6),
+                           "volumes_mb": round(largest / 1e6),
+                           "peak_mb": round((working + largest) / 1e6),
+                           "batches_per_slab": len(batches(cands, depth, itemsize, room))}
 
 
 # ---------------------------------------------------------------- the registration
@@ -426,11 +577,13 @@ def register(source, cfg, backend, scene_id, rects, ref_plane, progress=None, sl
 
     ms = sorted(rects)
     cands = candidates(rects, rc.min_overlap, rc.max_shift)
-    budget = cfg.mosaic_cache_mb * 1e6
     dtype = np.dtype(source.dtype)
     for c in cands:
         c["step"] = score_step(c["overlap"][0] * c["overlap"][1] * depth)
         c["proposed"] = []                       # distinct shifts, in the order proposed
+    tile_bytes = max(r[2] * r[3] for r in rects.values()) * dtype.itemsize
+    threads, room, memory = working_plan(cands, tile_bytes, depth, dtype.itemsize,
+                                         cfg.read_threads, cfg.mosaic_cache_mb * 1e6)
 
     def fill(c, o, va, vb):
         """Score, in this slab, every shift the pair's slabs have proposed so far."""
@@ -440,7 +593,7 @@ def register(source, cfg, backend, scene_id, rects, ref_plane, progress=None, sl
 
     def first_look(k):
         def job(c, va, vb):
-            o = measure(backend, rc, max_z, c, va, vb)
+            o = measure(backend, rc, max_z, c, va, vb, workers=threads)
             o["slab"] = k
             c["obs"].append(o)
             if not o["reason"]:
@@ -449,10 +602,11 @@ def register(source, cfg, backend, scene_id, rects, ref_plane, progress=None, sl
                 fill(c, o, va, vb)
         return job
 
-    # Tiles are read, and pairs measured, on the run's read threads. A pair is only ever
-    # touched by the one thread measuring it, and slabs are taken in turn, so the result
-    # does not depend on how the threads are scheduled.
-    with ThreadPoolExecutor(max(1, cfg.read_threads)) as pool:
+    # Tiles are read, and pairs measured, on the run's read threads (fewer if their
+    # tiles would not fit: see working_plan), and the transform is given the same number.
+    # A pair is only ever touched by the one thread measuring it, and slabs are taken in
+    # turn, so the result does not depend on how the threads are scheduled.
+    with ThreadPoolExecutor(threads) as pool:
         def each(k, group, job):
             """job(pair, va, vb) for every pair of `group` on its volumes in slab k,
             a batch that fits the memory budget at a time."""
@@ -461,7 +615,7 @@ def register(source, cfg, backend, scene_id, rects, ref_plane, progress=None, sl
                 def bar(jobs, total):
                     return progress(jobs, total=total, leave=False,
                                     desc=f"register Z {slabs[k][0]}-{slabs[k][-1]}")
-            for batch in batches(group, len(slabs[k]), dtype.itemsize, budget):
+            for batch in batches(group, len(slabs[k]), dtype.itemsize, room):
                 vols = load(read, slabs[k], batch, dtype, pool, bar)
                 list(pool.map(lambda cv: job(cv[0], *cv[1]), zip(batch, vols)))
 
@@ -483,7 +637,7 @@ def register(source, cfg, backend, scene_id, rects, ref_plane, progress=None, sl
             each(k, [c for c, _ in items], lambda c, va, vb: fill(c, waiting[id(c)], va, vb))
 
     spans = [[s[0], s[-1]] for s in slabs]
-    edges, pairs = [], []
+    edges, pairs, in_fit = [], [], []
     for c in cands:
         obs = c["obs"]
         good = [o for o in obs if not o["reason"]]
@@ -507,6 +661,7 @@ def register(source, cfg, backend, scene_id, rects, ref_plane, progress=None, sl
                     o["status"] = "ambiguous"
             edges.append((c["i"], c["j"], shift,
                           max(sum(o["at"][shift] - o["base"] for o in good), 1e-3)))
+            in_fit.append(len(pairs))            # the record this pair is about to get
         reason = shown["reason"]
         if reason and len(slabs) > 1:
             z0, z1 = spans[shown["slab"]]
@@ -525,20 +680,28 @@ def register(source, cfg, backend, scene_id, rects, ref_plane, progress=None, sl
             "depth_difference": max(differing, default=0),
             "slabs": [_slab_record(o, spans, shift) for o in obs]})
 
-    corr, residual, residual_z, orphans = solve(ms, edges)
+    corr, residual, residual_z, orphans, apart, dropped = solve(ms, edges)
+    for k, (n, d) in enumerate(zip(in_fit, apart)):
+        pairs[n]["from_fit"] = list(d)           # how far the pair is from the fit
+        pairs[n]["left_out_of_fit"] = k in dropped
+    left_out = [pairs[in_fit[k]] for k in dropped]
     acc = [p for p in pairs if p["accepted"]]
     log = {"scene": scene_id, "source": "refine", "mode": "3d",
            "reference_plane": ref_plane, "z_slabs": spans, "max_shift_z": max_z,
            "n_pairs": len(pairs), "n_accepted": len(acc),
            "n_confirming_metadata": sum(p["confirms_metadata"] for p in acc),
            "rms_residual_px": residual, "rms_residual_z": residual_z,
+           "left_out_of_fit": [[p["i"], p["j"]] for p in left_out],
+           "left_out_by": [max((max(abs(p["from_fit"][0]), abs(p["from_fit"][1]))
+                                for p in left_out), default=0),
+                           max((abs(p["from_fit"][2]) for p in left_out), default=0)],
            "unconstrained_tiles": orphans,
            "max_correction_px": max((abs(v[0]) + abs(v[1]) for v in corr.values()),
                                     default=0),
            "z_correction_range": [min((v[2] for v in corr.values()), default=0),
                                   max((v[2] for v in corr.values()), default=0)],
            "incomplete_planes": incomplete_planes(source.sel_z, corr, dims.get("Z")),
-           "n_planes": len(source.sel_z),
+           "n_planes": len(source.sel_z), "memory": memory,
            "depth": depth_summary(spans, pairs) if len(slabs) > 1 else None,
            "pairs": pairs, "corrections": {str(m): list(v) for m, v in corr.items()}}
     return corr, log
@@ -602,12 +765,15 @@ def format_report(log):
     res = (f"RMS residual {log['rms_residual_px']:.2f} px, "
            f"{log['rms_residual_z']:.2f} planes in Z"
            if log["rms_residual_px"] is not None else "no global fit")
+    if log.get("left_out_of_fit"):
+        res += f" over the {n - len(log['left_out_of_fit'])} in the fit"
     out = [f"scene {sid if sid is not None else '-'}: "
            f"{n}/{log['n_pairs']} pairs accepted, {res}"]
     depth = spans[0][1] - spans[0][0] + 1
     out.append(f"  3D registration on {len(spans)} slab(s) of {depth} planes "
                f"(Z {', '.join(f'{a}-{b}' for a, b in spans)}), "
                f"Z offsets searched to +/-{log['max_shift_z']} planes")
+    out.extend(_format_memory(log.get("memory")))
     if log["n_confirming_metadata"]:
         out.append(f"  {log['n_confirming_metadata']} of the accepted pair(s) match best "
                    "where the stage put them")
@@ -615,6 +781,13 @@ def format_report(log):
     if orphans:
         out.append(f"  [warn] {len(orphans)} tile(s) unconstrained {orphans[:8]}"
                    f"{' ...' if len(orphans) > 8 else ''} - left at metadata positions")
+    gone = log.get("left_out_of_fit") or []
+    if gone:
+        px, planes = log["left_out_by"]
+        names = ", ".join(f"{i}-{j}" for i, j in gone[:8]) + (" ..." if len(gone) > 8 else "")
+        out.append(f"  [warn] {len(gone)} accepted pair(s) left out of the fit ({names}): "
+                   f"up to {px} px / {planes} planes from where the other pairs put their "
+                   "tiles. Look at those seams in the preview.")
     z0, z1 = log["z_correction_range"]
     out.append(f"  max |correction| {log['max_correction_px']} px; Z corrections "
                + ("none" if z0 == z1 == 0 else f"{z0:+d} to {z1:+d} planes"))
@@ -635,6 +808,22 @@ def format_report(log):
                    "stack there, and no plane is invented to fill the gap.")
     out.extend(_format_depth(log, spans))
     return "\n".join(out)
+
+
+def _format_memory(m):
+    """What registration used of the threads and memory the settings allow."""
+    if not m:
+        return []
+    line = (f"  {m['threads']} thread(s), up to {m['peak_mb']} MB: {m['volumes_mb']} MB of "
+            f"overlap volumes"
+            + (f" at a time ({m['batches_per_slab']} batches a slab)"
+               if m["batches_per_slab"] > 1 else "")
+            + f" + {m['working_mb']} MB working")
+    if m["peak_mb"] <= m["budget_mb"]:
+        return [line + f", within mosaic_cache_mb = {m['budget_mb']}"]
+    return [line, f"  [warn] that is over mosaic_cache_mb = {m['budget_mb']}: one pair's "
+                  "volumes and one transform are the least it can work with. Raise "
+                  "mosaic_cache_mb to cover it, or lower refine.slab to need less."]
 
 
 def _format_depth(log, spans):

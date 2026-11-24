@@ -110,9 +110,14 @@ class Pipeline:
         self.log(self.source.describe())
         peak = (cfg.prefetch_tiles * cfg.tile[0] * cfg.tile[1]
                 * np.dtype(self.source.dtype).itemsize * self.source.samples)
-        self.log(f"\nestimated pipeline RAM (tiles in flight): {peak / 1e6:.0f} MB"
-                 + (f" + {cfg.mosaic_cache_mb} MB mosaic cache"
-                    if cfg.stitch_mode != "metadata" else ""))
+        cache = ""
+        if cfg.stitch_mode != "metadata":
+            cache = f" + {cfg.mosaic_cache_mb} MB mosaic cache"
+            if cfg.stitch_mode == "refine" and cfg.refine.mode == "3d":
+                # Registration is over before conversion starts, so the two do not add.
+                cache += (" (3D registration works within that cap first; plan() prints "
+                          "what it uses)")
+        self.log(f"\nestimated pipeline RAM (tiles in flight): {peak / 1e6:.0f} MB{cache}")
         return self
 
     def plan(self):

@@ -32,6 +32,12 @@ def cast_to(arr, dtype):
     return out.astype(dtype)
 
 
+# Peak working memory of one volume transform on the CPU, per voxel of the volume: the two
+# windowed copies and their spectra, in single precision. Measured at 12.1; the rest is
+# room for what the FFT library allocates out of sight.
+VOLUME_BYTES_PER_VOXEL = 16
+
+
 class Backend:
     """Holds the CuPy handle, if there is one, plus the lock guarding it."""
 
@@ -77,19 +83,21 @@ class Backend:
         np.clip(g, 0, 255, out=g)
         return g.astype(np.uint8)
 
-    def fft_phase_correlation(self, a, b):
+    def fft_phase_correlation(self, a, b, workers=1):
         """Normalised cross-power spectrum; returns the correlation surface.
 
         `a` and `b` are two planes, or two (Z, Y, X) volumes for 3D registration. A
         volume is transformed in single precision: the peak is what matters, and at full
         resolution an overlap volume is large enough that doubling it shows in the RAM.
+        `workers` is how many threads a volume's transform may use on the CPU. The caller
+        passes the run's own thread count: nothing here reaches for the machine's.
         """
         if np.ndim(a) > 2 and not self.gpu:
-            # One volume at a time. The transform already runs across every core, and
-            # several at once, from threads measuring different pairs, would multiply
-            # the working memory for no gain.
+            # One volume at a time. The transform runs across the threads it is given,
+            # and several at once, from threads measuring different pairs, would
+            # multiply the working memory (VOLUME_BYTES_PER_VOXEL) for no gain.
             with self._lock:
-                return self._volume_correlation(a, b)
+                return self._volume_correlation(a, b, max(1, int(workers)))
         a = np.asarray(a, np.float32)
         b = np.asarray(b, np.float32)
         a = a - a.mean()
@@ -111,13 +119,13 @@ class Backend:
         return np.fft.irfft2(R, s=a.shape)
 
     @staticmethod
-    def _volume_correlation(a, b):
-        """The CPU path for volumes: in place where possible, and across cores when scipy
-        is there to do it (numpy's FFT is single-threaded)."""
+    def _volume_correlation(a, b, workers=1):
+        """The CPU path for volumes: in place where possible, and across `workers`
+        threads when scipy is there to do it (numpy's FFT is single-threaded)."""
         rfftn, irfftn, kw = np.fft.rfftn, np.fft.irfftn, {}
         try:
             from scipy import fft as sfft
-            rfftn, irfftn, kw = sfft.rfftn, sfft.irfftn, {"workers": -1}
+            rfftn, irfftn, kw = sfft.rfftn, sfft.irfftn, {"workers": workers}
         except ImportError:
             pass
         shape, spectra = np.shape(a), []

@@ -115,6 +115,12 @@ for you; `benchmark()` names the stage they are limiting. Peak conversion memory
 still `prefetch × tile`, so it now grows with the CPU count: about 200 MB of 16-bit
 1024 px tiles at the 32-thread ceiling.
 
+3D registration keeps to the same settings. It reads tiles, measures pairs and runs its
+volume transform on `n_read_threads` threads and no others, and everything it holds,
+overlap volumes and working memory together, fits `mosaic_cache_mb`: the compositor's
+cache, which is empty until registration is over. `plan()` prints the threads and MB it
+used, and warns if one pair alone needs more than the cap.
+
 ## Registration with `stitch_mode="refine"`
 
 `refine` corrects the stage positions by a single integer XY shift per tile. By default
@@ -196,6 +202,14 @@ Z offset says belongs at the plane being written.
   with it, wrong sign included. A pair that matches best where the stage already put it
   is kept as a weak constraint, so tiles the stage has right hold each other in place.
   A shift that would leave less than `min_overlap` of overlap is not scored at all.
+- **How tiles are placed.** One weighted least-squares fit over every accepted pair, so
+  error does not build up across the mosaic. Pairs that are plainly wrong are left out
+  and the fit redone: a pair more than 3.5 px, or 1.5 planes, from where the other pairs
+  put its two tiles, provided those tiles are still joined by two separate routes without
+  it, and it is at least four times as far out as the typical pair. The last condition
+  keeps a mosaic whose pairs all disagree a little, as when the tissue moved between
+  tiles, from being whittled down to the few that happen to agree. Pairs left out are
+  named in a `[warn]` line; look at those seams. (The 2D fit is plain least squares.)
 - **What Z corrections are relative to.** XY is pinned at the first tile, as in 2D. Along
   Z the median tile keeps its own planes, so as few stacks as possible are moved.
 - **The ends of the stack.** The output has the planes you selected and no others. A
@@ -225,14 +239,22 @@ with depth, and is reported, not corrected.
 the defaults, against 5 in 2D). Some are read again: where a pair's slabs proposed
 shifts the others had not already scored, and where the overlap volumes do not all fit
 `mosaic_cache_mb` at once, since pairs are then measured in batches and the tiles shared
-between batches are read for each. Tiles are read and pairs measured on the run's read
-threads (`n_read_threads`); the record is the same however many there are. Memory is
-that cap plus one volume transform, whatever the thread count. In a synthetic benchmark
-with 1920 px tiles and 10% overlap, a pair took 29 ms per slab on 8 threads (68 ms on
-one), and memory peaked about 140 MB above the overlap volumes held. A large overlap is
-scored on a lattice of at least a million voxels rather than on all of them. On a slow
-disk the reads will dominate. `.stitch.json` records every pair's shift in every slab,
-and corrections as `[dy, dx, dz]`.
+between batches are read for each. Tiles are read, pairs measured and the volume
+transform run on the run's read threads (`n_read_threads`) and no others; the record is
+the same however many there are. The cap covers everything held at once: the volumes,
+one transform (16 bytes a voxel of the largest overlap), a whole tile per thread while
+reading, and two planes per thread while scoring. Batches shrink to leave room for
+those, and very large tiles are read on fewer threads. The report states the figure:
+
+```
+  8 thread(s), up to 385 MB: 273 MB of overlap volumes + 112 MB working, within mosaic_cache_mb = 768
+```
+
+That is for six 1920 px tiles with 10% overlap, where a pair took 26 ms per slab on 8
+threads (77 ms on one). A large overlap is scored on a lattice of at least a million
+voxels rather than on all of them. On a slow disk the reads will dominate.
+`.stitch.json` records every pair's shift in every slab, and corrections as
+`[dy, dx, dz]`. With a GPU the transform's memory is on the device, and is not counted.
 
 ## Interrupting and restarting
 
@@ -294,7 +316,7 @@ Every stage can be interrupted and re-run; nothing that finished is redone.
 ## Tests
 
 ```bash
-python -m pytest                  # 326 tests
+python -m pytest                  # 339 tests
 python tools/minipytest.py        # if pytest is unavailable
 ```
 
@@ -328,7 +350,12 @@ covered: a Z offset beyond `max_shift_z` is rejected rather than clipped, includ
 a single plane past the range; a walk that never settles; a sliver of overlap; a
 featureless slab; an offset that changes with depth; batches under a small memory cap,
 and any number of threads, giving the identical record; and an output's fingerprint
-changing only when a tile actually moves along Z.
+changing only when a tile actually moves along Z. That it keeps to the run's settings
+is tested too: the transform is given `n_read_threads` and not the machine's CPU count,
+the memory the report states fits `mosaic_cache_mb`, and what numpy actually allocates
+stays under the stated figure. The fit is tested with pairs made wrong on purpose: one
+or two among twenty are left out and the tiles land exactly; a tile's only link, three
+tiles in a ring, and pairs that all disagree a little are all kept.
 
 `tests/test_real_czi.py` is the exception to the fakes: it writes a mosaic CZI with
 pylibCZIrw and takes it through the real `Source` and aicspylibczi, in 2D and in 3D, to
@@ -418,9 +445,17 @@ Found by review rather than in the field:
   planes. In either mode an offset that changes with depth (a tilted or sheared tile) is
   reported by the depth check and not corrected; with only two usable planes that
   disagree, the tile is left between the two. No chromatic correction.
-- **3D registration has not been run on microscope data.** It is tested end to end on a
-  real CZI file, but one written here from a synthetic volume. Its GPU path has only
-  been run with numpy standing in for CuPy, which checks the code and not the device.
+- **3D registration has not been run on a tiled acquisition.** The suite tests it end to
+  end on a real CZI file written from a synthetic volume. Outside the suite it has been
+  run on real two-photon z-stacks cut into overlapping tiles at known offsets: with
+  every tile from one acquisition it recovered each offset exactly and the output
+  equalled the original stack. With tiles drawn alternately from two acquisitions of one
+  field, so that overlaps had independent noise and the tissue had moved between them,
+  two of the twelve pairs spanning the acquisitions measured 20 px out. They are left
+  out of the fit and named, and the tiles then land within 2 px and one plane of the
+  best whole-field alignment of the two acquisitions, which is itself no better defined
+  than that: the tissue was not rigidly related between them. Its GPU path has only been
+  run with numpy standing in for CuPy, which checks the code and not the device.
   Look at `preview()` and the report before a long conversion. It does not interpolate
   between planes, so a true half-plane offset is corrected to the nearer whole plane,
   and it does not add planes: the first and last few output planes can lack the tiles
