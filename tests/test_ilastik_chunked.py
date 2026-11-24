@@ -59,6 +59,7 @@ class FakeIlastik:
         self.calls = 0
         self.fail_on = None          # (call number, exception) to raise instead of running
         self.bad_shape_on = None     # call number that "succeeds" with a malformed export
+        self.no_output_on = None     # call number that "succeeds" having written nothing
         self.dry = False             # behave like cfg.ilastik.dry_run: print, don't run
 
     def __call__(self, cfg, cmd, log_path, log=print):
@@ -67,6 +68,11 @@ class FakeIlastik:
             return False
         if self.fail_on and self.calls == self.fail_on[0]:
             raise self.fail_on[1]
+        if self.calls == self.no_output_on:
+            log_path.write_text("Traceback (most recent call last):\n"
+                                "ValueError: Key backend: not a valid value\n",
+                                encoding="utf-8")
+            return True
         out = [a.split("=", 1)[1] for a in cmd if a.startswith("--output_filename_format=")][0]
         h5_path, internal = cmd[-1].rsplit(".h5/", 1)
         with h5py.File(h5_path + ".h5", "r") as f:
@@ -231,6 +237,44 @@ def test_export_with_the_wrong_shape_fails_that_chunk_and_is_retried(run):
     assert run.fake.calls == 4
     data, _ = exported(run.out)
     assert np.array_equal(data, classifier(run.vol))
+
+
+def test_chunk_that_exports_nothing_names_the_file_and_quotes_ilastiks_error(run):
+    """ilastik has exited 0 having written nothing. That used to surface as h5py failing
+    to open an object, with no word on which file was meant or why it was empty."""
+    run.fake.no_output_on = 2
+    with pytest.raises(RuntimeError, match=r"chunk 2/5 \(Z=5:10\)") as e:
+        run()
+    msg = str(e.value)
+    assert "wrote no output file (seg.chunk_out.h5)" in msg
+    assert "ValueError: Key backend" in msg
+    assert "seg.chunk_z000005.ilastik.log" in msg
+    _, prog = exported(run.out)
+    assert prog["z_done"] == 5 and not prog["complete"]
+
+    run.fake.no_output_on, run.fake.calls = None, 0
+    assert run() is True
+    assert run.fake.calls == 4
+    data, _ = exported(run.out)
+    assert np.array_equal(data, classifier(run.vol))
+
+
+def test_file_holding_no_export_at_all_is_started_afresh(run):
+    """Left by a non-chunked run that exported nothing yet was marked complete. Asking for
+    overwrite=True to get past it would have been asking to rebuild nothing."""
+    with h5py.File(run.out, "w") as f:
+        f.attrs[ilastik.EXPORT_DONE_ATTR] = "a job that exported nothing"
+    assert run() is True
+    data, prog = exported(run.out)
+    assert np.array_equal(data, classifier(run.vol)) and prog["complete"]
+
+
+def test_export_without_a_progress_record_is_not_overwritten(run):
+    with h5py.File(run.out, "w") as f:
+        f.create_dataset("exported_data", data=np.ones((1, 2, 1, 4, 4), np.uint8))
+    with pytest.raises(RuntimeError, match="progress record"):
+        run()
+    assert run.fake.calls == 0
 
 
 def test_dry_run_stops_after_printing_the_first_chunk(run):

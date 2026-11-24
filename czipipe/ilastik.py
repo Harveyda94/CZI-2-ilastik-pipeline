@@ -276,8 +276,35 @@ def _kill_tree(proc, grace=5.0):
         proc.wait(timeout=30)
 
 
+# The last line of a Python traceback: "ValueError: ...", "pkg.mod.SlotNotReadyError: ...".
+_EXC_LINE = re.compile(r"[\w.]*(Error|Exception)\w*(:|\s*$)")
+# ilastik's excepthook writes this when an exception escapes its main thread. Headless,
+# that is the end of the run, whatever the exit code says -- unless the export had
+# already finished, which the workflow announces with _DONE_LINE.
+_FATAL_LINE = "Unhandled exception in thread: 'MainThread'"
+_DONE_LINE = "Completed Batch Processing"
+
+
+def _log_reason(log_path, limit=400):
+    """The last exception line in an ilastik log, or '' when there is none to show."""
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        if _EXC_LINE.match(line):
+            return line.strip()[:limit]
+    return ""
+
+
 def run_command(cfg, cmd, log_path, log=print, heartbeat_s=300):
     env = os.environ.copy()
+    # ilastik is its own Python installation, and this variable is addressed to the
+    # notebook's: a Jupyter kernel sets it to its inline backend, which ilastik's
+    # matplotlib does not have. ilastik 1.4.2 imports matplotlib while loading its
+    # plugins, rejects the value and stops before it has opened the project.
+    env.pop("MPLBACKEND", None)
     env["LAZYFLOW_TOTAL_RAM_MB"] = str(cfg.ilastik_ram_mb)
     env["LAZYFLOW_THREADS"] = str(cfg.ilastik_threads)
     env.setdefault("PYTHONIOENCODING", "utf-8")     # so ilastik writes what we decode
@@ -326,6 +353,7 @@ def run_command(cfg, cmd, log_path, log=print, heartbeat_s=300):
     threading.Thread(target=pump, name="ilastik-output", daemon=True).start()
     timed_out = False
     log_ok = True
+    exported, fatal, reason = False, False, ""
     last_beat, last_cpu = time.monotonic(), _proc_tree_cpu_seconds(proc.pid)
     try:
         with open(log_path, "w", encoding="utf-8") as logf:
@@ -352,6 +380,12 @@ def run_command(cfg, cmd, log_path, log=print, heartbeat_s=300):
                         # an hours-long run; the key lines still reach the notebook below.
                         log_ok = False
                         log(f"  [warn] couldn't write ilastik log ({e}); continuing without it")
+                if _DONE_LINE in line:
+                    exported = True
+                elif _FATAL_LINE in line and not exported:
+                    fatal = True
+                elif _EXC_LINE.match(line):
+                    reason = line.strip()[:400]
                 if any(k in line for k in ("ERROR", "Error", "Traceback", "%", "Exporting")):
                     log("   | " + line.rstrip()[:400])
             if not timed_out:
@@ -366,10 +400,51 @@ def run_command(cfg, cmd, log_path, log=print, heartbeat_s=300):
         _kill_tree(proc)
         raise RuntimeError(f"ilastik exceeded timeout_h ({cfg.ilastik.timeout_h} h); "
                            "it and any processes it started were stopped")
-    if proc.returncode != 0:
-        raise RuntimeError(f"ilastik exited {proc.returncode}; see {log_path}")
+    # The exit code alone is not enough: the Windows launcher has returned 0 after ilastik
+    # stopped on an unhandled exception, having exported nothing.
+    if proc.returncode != 0 or fatal:
+        what = (f"ilastik exited {proc.returncode}" if proc.returncode else
+                "ilastik stopped on an unhandled error, although it exited with code 0")
+        raise RuntimeError(what + (f":\n    {reason}\n" if reason else "; ")
+                           + f"see {log_path}")
     log(f"  classified in {(time.perf_counter()-t0)/60:.1f} min")
     return True
+
+
+class ExportMissing(RuntimeError):
+    """ilastik reported success, but its output does not hold the export asked for."""
+
+
+def _check_export(out_h5, log_path, want=None, what="ilastik"):
+    """Raise ExportMissing unless `out_h5` holds an export (of shape `want`, if given).
+
+    Called after every run that exited cleanly and before anything is built on its
+    output, so a run that wrote nothing is reported as that, with ilastik's own last
+    error, instead of as a missing HDF5 object several steps later.
+    """
+    import h5py
+
+    out_h5 = Path(out_h5)
+    if not out_h5.is_file():
+        problem = f"it wrote no output file ({out_h5.name})"
+    else:
+        try:
+            with h5py.File(out_h5, "r") as f:
+                if "/exported_data" not in f:
+                    problem = f"{out_h5.name} holds no 'exported_data'"
+                elif want is not None and tuple(f["/exported_data"].shape) != tuple(want):
+                    problem = (f"the export in {out_h5.name} has shape "
+                               f"{tuple(f['/exported_data'].shape)}, not the expected "
+                               f"{tuple(want)}")
+                else:
+                    return
+        except Exception as exc:
+            problem = f"{out_h5.name} could not be read ({type(exc).__name__}: {exc})"
+    reason = _log_reason(log_path)
+    raise ExportMissing(
+        f"{what} exited without an error code, but {problem}.\n"
+        + (f"ilastik's log ends with:\n    {reason}\n" if reason else "")
+        + f"Full log: {log_path}")
 
 
 # ---------------------------------------------------------------- restart bookkeeping
@@ -402,14 +477,18 @@ def _export_is_complete(out_h5, key):
     import h5py
     try:
         with h5py.File(out_h5, "r") as f:
-            return _as_str(f.attrs.get(EXPORT_DONE_ATTR)) == key
+            # The marker alone is not proof. It was once written to a file ilastik had
+            # never touched, and such a file must be classified again, not reused.
+            return (_as_str(f.attrs.get(EXPORT_DONE_ATTR)) == key
+                    and "/exported_data" in f)
     except Exception:
         return False
 
 
 def _mark_export_complete(out_h5, key):
     import h5py
-    with h5py.File(out_h5, "a") as f:
+    # "r+", never "a": marking must not be able to create the file it vouches for.
+    with h5py.File(out_h5, "r+") as f:
         f.attrs[EXPORT_DONE_ATTR] = key
         f.flush()
 
@@ -558,6 +637,10 @@ def _chunk_resume_state(h5py, out_h5, want_hash, want_payload):
         return "new", 0, None
     try:
         with h5py.File(out_h5, "r") as f:
+            if "progress" not in f and "/exported_data" not in f:
+                # Nothing to continue and nothing to lose, e.g. the file an earlier
+                # version created to mark complete a run that had exported nothing.
+                return "new", 0, None
             prog = f["progress"]
             got = prog.attrs["fingerprint"]
             got = got.decode() if isinstance(got, bytes) else got
@@ -714,25 +797,24 @@ def run_classify_chunked(cfg, exe, ilp, raw_h5, internal, out_h5, axes, export_s
             return False   # dry_run: printed the next pending chunk's command and stopped
 
         trim0 = z0 - pad0   # offset of the wanted [z0:z1] range within the padded chunk
-        expected_chunk_shape = (T, pad1 - pad0, C, Y, X)
+        this = f"chunk {i + 1}/{n_chunks} (Z={z0}:{z1})"
+        retry = ("\nNothing already exported is lost: running classify() again retries "
+                 "this chunk (its stale output is cleared automatically).")
         try:
-            with h5py.File(chunk_out_h5, "r") as cf:
-                csrc = cf["/exported_data"]
-                if tuple(csrc.shape) != expected_chunk_shape:
-                    raise ValueError(f"shape {tuple(csrc.shape)} != expected "
-                                     f"{expected_chunk_shape}")
-                with h5py.File(out_h5, "r+") as f:
-                    dst = f["/exported_data"]
-                    for zi in range(z1 - z0):
-                        dst[:, z0 + zi] = csrc[:, trim0 + zi]
-                    f["progress"].attrs["z_done"] = z1
+            _check_export(chunk_out_h5, chunk_log, want=(T, pad1 - pad0, C, Y, X),
+                          what=f"{this}: ilastik")
+            with h5py.File(chunk_out_h5, "r") as cf, h5py.File(out_h5, "r+") as f:
+                csrc, dst = cf["/exported_data"], f["/exported_data"]
+                for zi in range(z1 - z0):
+                    dst[:, z0 + zi] = csrc[:, trim0 + zi]
+                f["progress"].attrs["z_done"] = z1
+        except ExportMissing as e:
+            raise ExportMissing(f"{e}{retry}") from None
         except Exception as e:
             raise RuntimeError(
-                f"chunk {i + 1}/{n_chunks} (Z={z0}:{z1}) failed after ilastik exited without "
-                f"an error code: {type(e).__name__}: {e}. ilastik has been seen to log a "
-                f"fatal error yet still exit 0 -- check {chunk_log} for what actually "
-                "happened. Re-running classify() will retry this chunk fresh (the stale "
-                "output is cleared automatically)."
+                f"{this}: copying ilastik's output into {out_h5.name} failed "
+                f"({type(e).__name__}: {e}). ilastik has been seen to log a fatal error yet "
+                f"still exit 0 -- check {chunk_log} for what actually happened.{retry}"
             ) from e
         chunk_in_h5.unlink(missing_ok=True)
         chunk_out_h5.unlink(missing_ok=True)
@@ -799,11 +881,10 @@ def classify(source, cfg, tiler, results, log=print, progress=None):
                     if out_h5.exists() and not cfg.ilastik.dry_run:
                         log(f"  removing {out_h5.name} left by an interrupted run")
                         out_h5.unlink()
-                    if not run_command(cfg, cmd,
-                                       cfg.out_dir / f"{cfg.stem}{plan.suffix}_{tag}"
-                                                     ".ilastik.log",
-                                       log=log):
+                    run_log = cfg.out_dir / f"{cfg.stem}{plan.suffix}_{tag}.ilastik.log"
+                    if not run_command(cfg, cmd, run_log, log=log):
                         continue
+                    _check_export(out_h5, run_log, what=f"[{tag}] ilastik")
                     _mark_export_complete(out_h5, key)
                 seg_to_tiff(source, cfg, tiler, out_h5, out_tiff, info["classes"],
                             progress=progress)

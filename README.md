@@ -273,6 +273,10 @@ Every stage can be interrupted and re-run; nothing that finished is redone.
   is marked complete, and tied to the project file and input it came from); an
   interrupted ilastik run starts again, since ilastik cannot resume. The HDF5 staged for
   ilastik from a TIFF is kept until every project has finished.
+- **A run that exports nothing is an error**, whatever ilastik's exit code: the Windows
+  launcher has returned 0 after ilastik stopped on an exception at start-up. The message
+  names the output file, quotes the last error in ilastik's log and gives the log's path.
+  Such a run is never marked complete, so the next `classify()` runs it again.
 - **Classify in Z-chunks** for runs measured in hours: `cfg.ilastik.chunk_z = 50` runs
   ilastik on 50 planes at a time, each with a Z-halo sized from the project's largest
   feature sigma so there are no seams, and checkpoints after every chunk. An interruption
@@ -316,7 +320,7 @@ Every stage can be interrupted and re-run; nothing that finished is redone.
 ## Tests
 
 ```bash
-python -m pytest                  # 339 tests
+python -m pytest                  # 348 tests
 python tools/minipytest.py        # if pytest is unavailable
 ```
 

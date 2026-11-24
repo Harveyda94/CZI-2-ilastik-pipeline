@@ -213,6 +213,77 @@ def test_classify_without_convert_says_what_to_do(job):
         p.classify()
 
 
+# ---------------------------------------------------------------- runs that export nothing
+DIED_AT_STARTUP = """\
+ERROR 2026-11-24 14:43:14,982 excepthooks 17180 27656 Unhandled exception in thread: 'MainThread'
+ERROR 2026-11-24 14:43:14,998 excepthooks 17180 27656 Traceback (most recent call last):
+  File "matplotlib/__init__.py", line 774, in __setitem__
+    raise ValueError(f"Key {key}: {ve}") from None
+ValueError: Key backend: 'module://matplotlib_inline.backend_inline' is not a valid value
+
+ilastik error:
+The operation completed successfully.
+"""
+
+
+def test_run_that_writes_nothing_fails_and_marks_nothing_complete(job, monkeypatch):
+    """ilastik on Windows exited 0 after stopping at start-up. Marking the export complete
+    then created it, empty; the conversion failed on a missing HDF5 object, and every
+    later run reused the empty file and failed the same way."""
+    real = ilastik.run_command
+
+    def wrote_nothing(cfg_, cmd, log_path, log=print):
+        log_path.write_text(DIED_AT_STARTUP, encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(ilastik, "run_command", wrote_nothing)
+    with pytest.raises(RuntimeError, match="wrote no output file") as e:
+        classify(job)
+    assert "ValueError: Key backend" in str(e.value)
+    assert "fake_seg.ilastik.log" in str(e.value)
+    assert not job.export.exists() and not job.seg.exists()
+
+    monkeypatch.setattr(ilastik, "run_command", real)
+    classify(job)
+    assert seg_is_correct(job) and len(job.runs) == 1
+
+
+def test_output_without_an_export_fails_and_is_classified_again(job, monkeypatch):
+    real = ilastik.run_command
+
+    def wrote_an_empty_file(cfg_, cmd, log_path, log=print):
+        out = [a.split("=", 1)[1] for a in cmd if a.startswith("--output_filename_format=")][0]
+        with FakeH5.File(out, "w") as fo:
+            fo.flush()
+        return True
+
+    monkeypatch.setattr(ilastik, "run_command", wrote_an_empty_file)
+    with pytest.raises(RuntimeError, match="holds no 'exported_data'"):
+        classify(job)
+    assert not job.seg.exists()
+
+    monkeypatch.setattr(ilastik, "run_command", real)
+    msgs = []
+    classify(job, log=msgs.append)
+    assert seg_is_correct(job) and len(job.runs) == 1
+    assert not any("reusing" in m and job.export.name in m for m in msgs)
+
+
+def test_completion_marker_on_a_file_with_no_export_is_not_trusted(job):
+    """What the earlier version left behind. It has to be classified again, not reused."""
+    with FakeH5.File(job.export, "w") as f:
+        f.attrs[ilastik.EXPORT_DONE_ATTR] = "this job"
+        f.flush()
+    assert not ilastik._export_is_complete(job.export, "this job")
+
+    with FakeH5.File(job.export, "w") as f:
+        f.create_dataset("exported_data", shape=(1, 2, 1, 4, 4), dtype=np.uint8)
+        f.attrs[ilastik.EXPORT_DONE_ATTR] = "this job"
+        f.flush()
+    assert ilastik._export_is_complete(job.export, "this job")
+    assert not ilastik._export_is_complete(job.export, "another job")
+
+
 # ---------------------------------------------------------------- process control
 def _script(tmp_path, body):
     path = tmp_path / "fake_ilastik.py"
@@ -297,6 +368,43 @@ def test_nonzero_exit_is_reported(cfg, tmp_path):
     cmd = _script(tmp_path, "import sys; print('ERROR bad project'); sys.exit(3)")
     with pytest.raises(RuntimeError, match="exited 3"):
         ilastik.run_command(cfg, cmd, tmp_path / "ilastik.log", log=lambda *a: None)
+
+
+def test_unhandled_error_is_a_failure_even_with_exit_code_zero(cfg, tmp_path):
+    """The Windows launcher printed "The operation completed successfully" and returned 0
+    after ilastik had stopped on an exception while loading its plugins."""
+    cmd = _script(tmp_path, """
+        print("ERROR excepthooks 1 2 Unhandled exception in thread: 'MainThread'")
+        print("Traceback (most recent call last):")
+        print("ValueError: Key backend: 'module://matplotlib_inline.backend_inline' is bad")
+    """)
+    with pytest.raises(RuntimeError, match="exited with code 0") as e:
+        ilastik.run_command(cfg, cmd, tmp_path / "ilastik.log", log=lambda *a: None)
+    assert "ValueError: Key backend" in str(e.value)
+    assert "ilastik.log" in str(e.value)
+
+
+def test_error_after_the_export_finished_does_not_fail_the_run(cfg, tmp_path):
+    cmd = _script(tmp_path, """
+        print("INFO ilastik.workflows.pixelClassification: Completed Batch Processing")
+        print("ERROR excepthooks 1 2 Unhandled exception in thread: 'MainThread'")
+    """)
+    assert ilastik.run_command(cfg, cmd, tmp_path / "ilastik.log",
+                               log=lambda *a: None) is True
+
+
+def test_notebook_matplotlib_backend_is_not_passed_to_ilastik(cfg, tmp_path, monkeypatch):
+    """A Jupyter kernel sets MPLBACKEND to its inline backend. ilastik 1.4.2 imports
+    matplotlib at start-up, does not have that backend, and stopped there."""
+    monkeypatch.setitem(os.environ, "MPLBACKEND", "module://matplotlib_inline.backend_inline")
+    cmd = _script(tmp_path, """
+        import os
+        print("Exporting with MPLBACKEND =", os.environ.get("MPLBACKEND"), flush=True)
+    """)
+    msgs = []
+    ilastik.run_command(cfg, cmd, tmp_path / "ilastik.log", log=msgs.append)
+    assert any("MPLBACKEND = None" in m for m in msgs)
+    assert os.environ["MPLBACKEND"].startswith("module://")    # the notebook keeps its own
 
 
 def test_ram_cap_defaults_to_three_quarters_of_the_installed_ram(cfg, monkeypatch):
