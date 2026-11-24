@@ -126,61 +126,104 @@ def test_no_z_offset_gives_the_xy_shifts_2d_registration_finds(cfg3):
     assert {m: v[:2] for m, v in corr.items()} == flat
 
 
-@pytest.mark.parametrize("noise", [100, 300, 800])
-def test_registration_survives_noise(cfg3, noise):
-    """Measured on this fixture: exact through sd=300, and at sd=800 one tile is a pixel
-    out in XY with Z still exact. A slab averages over many planes, so it holds up better
-    than a single plane does."""
+@pytest.mark.parametrize("noise", [300, 800, 2000])
+def test_registration_is_exact_under_noise(cfg3, noise):
+    """Phase correlation under noise puts a peak a step off as often as not. The NCC walk
+    is what settles it: over 6 seeds every tile is exact up to sd=2000, where taking the
+    peaks as they come left a third of the tiles a step out."""
     gt, tiles, meta = make_mosaic(noise=noise)
     corr, log = register(cfg3, tiles, meta)
-    assert all(corr[m][2] == PERT3[m][2] for m in POSITIONS)
-    assert max(abs(a - b) for m in POSITIONS for a, b in zip(corr[m], PERT3[m])) <= 1
+    assert corr == PERT3
     assert log["n_accepted"] == log["n_pairs"]
-    assert log["rms_residual_px"] < 1.5 and log["rms_residual_z"] < 0.5
+    assert log["rms_residual_px"] < 0.01 and log["rms_residual_z"] < 0.01
 
 
-def test_inverted_z_sign_is_caught(cfg3, monkeypatch):
-    """A Z offset is kept only if it matches better than the same XY shift without it.
-    Scored against the stage positions alone, getting XY right would carry a Z offset of
-    the wrong sign straight through: two pairs of this mosaic were accepted that way."""
-    gt, tiles, meta = make_mosaic()
+def test_heavy_noise_costs_a_step_at_most(cfg3):
+    """At sd=4000 the noise is as large as the signal. Measured over 6 seeds: 52 of 54
+    tiles exact and none out by more than one step, with one pair in 120 rejected."""
+    gt, tiles, meta = make_mosaic(noise=4000)
+    corr, log = register(cfg3, tiles, meta)
+    assert max(abs(a - b) for m in POSITIONS for a, b in zip(corr[m], PERT3[m])) <= 1
+    assert log["n_accepted"] >= log["n_pairs"] - 1
+
+
+# ---------------------------------------------------------------- NCC decides
+def relative(pair, pert=PERT3):
+    return tuple(b - a for a, b in zip(pert[pair["i"]], pert[pair["j"]]))
+
+
+def with_proposals(monkeypatch, change):
+    """Make phase correlation propose `change(dy, dx, dz)` instead of what it found."""
     real = refine3d.peaks
 
-    def flipped(backend, a, b, n=refine3d.PEAKS):
+    def wrong(backend, a, b, n=refine3d.PEAKS):
         shifts, sharp = real(backend, a, b, n)
-        return [(dy, dx, -dz) for dy, dx, dz in shifts], sharp
+        return [change(*s) for s in shifts], sharp
 
-    monkeypatch.setattr(refine3d, "peaks", flipped)
-    corr, log = register(cfg3, tiles, meta)
-    assert all(v[2] == 0 for v in corr.values())
-    assert all(p["shift"][2] == 0 for p in log["pairs"] if p["accepted"])
-    dropped = [s.get("z_offset_not_supported") for p in log["pairs"] for s in p["slabs"]]
-    assert sum(d is not None for d in dropped) >= 8
+    monkeypatch.setattr(refine3d, "peaks", wrong)
 
 
-def test_inverted_xy_sign_is_caught(cfg3, monkeypatch):
-    """The other way about: an XY shift is kept only if it matches better than the same
-    Z offset without it. Three pairs of this mosaic were accepted mirrored otherwise,
-    carried through by a Z offset that was right."""
+@pytest.mark.parametrize("change", [
+    lambda dy, dx, dz: (dy, dx, -dz),             # Z sign inverted
+    lambda dy, dx, dz: (-dy, -dx, dz),            # XY sign inverted
+    lambda dy, dx, dz: (-dy, -dx, -dz),           # both
+    lambda dy, dx, dz: (dy + 40, dx - 40, dz),    # nowhere near
+])
+def test_a_wrong_proposal_is_not_what_gets_accepted(cfg3, monkeypatch, change):
+    """Phase correlation only proposes. A shift is accepted where the NCC stops
+    improving, so a proposal of the wrong sign, or nowhere near, is either walked to the
+    true shift or rejected: it is never accepted as proposed. Measured on this mosaic,
+    17 to 19 of the 20 pairs end exactly right in each case. (The rest are corner
+    overlaps, 64 px square, where nothing within reach matches well.)"""
     gt, tiles, meta = make_mosaic()
-    real = refine3d.peaks
-
-    def flipped(backend, a, b, n=refine3d.PEAKS):
-        shifts, sharp = real(backend, a, b, n)
-        return [(-dy, -dx, dz) for dy, dx, dz in shifts], sharp
-
-    monkeypatch.setattr(refine3d, "peaks", flipped)
+    with_proposals(monkeypatch, change)
     corr, log = register(cfg3, tiles, meta)
-    refused = 0
+    right = 0
     for p in log["pairs"]:
-        mirrored = [PERT3[p["i"]][k] - PERT3[p["j"]][k] for k in (0, 1)]
+        want = relative(p)
+        proposed = change(*want)
         if p["accepted"]:
-            assert max(abs(a - b) for a, b in zip(p["shift"][:2], mirrored)) > 1, p
-        refused += not p["accepted"] or "xy_shift_not_supported" in p["slabs"][0]
-    # One pair's weaker peaks include one that, mirrored, happens to land near the truth
-    # along the axis it is furthest out on. That is a real improvement on the stage
-    # position, so it is accepted; the mirror of the true shift never is.
-    assert refused >= len(log["pairs"]) - 1
+            if max(abs(a - b) for a, b in zip(want, proposed)) > 1:      # a wrong proposal
+                assert max(abs(a - b) for a, b in zip(p["shift"], proposed)) > 1, p
+            right += tuple(p["shift"]) == want
+    assert right >= 17
+    assert sum(corr[m] == PERT3[m] for m in POSITIONS) >= 7
+
+
+def test_the_stage_position_is_a_proposal_too(cfg3, monkeypatch):
+    """With every correlation peak nowhere near, a pair whose true offset is within
+    reach of the stage position is still found, by walking from there."""
+    one = dict(FLAT)
+    one[4] = (-3, 5, 2)
+    gt, tiles, meta = make_mosaic(one)
+    with_proposals(monkeypatch, lambda dy, dx, dz: (dy + 40, dx - 40, dz))
+    corr, log = register(cfg3, tiles, meta)
+    assert corr == one
+    assert log["n_accepted"] == log["n_pairs"] and log["n_confirming_metadata"] == 12
+
+
+def test_a_walk_that_never_settles_is_rejected(cfg3, monkeypatch):
+    """Still improving after CLIMB steps means the proposal was nowhere near a match.
+    Keeping wherever the walk had got to would be a guess with a good score."""
+    real = refine3d.peaks
+
+    def three_planes_off(backend, a, b, n=refine3d.PEAKS):
+        (dy, dx, dz), sharp = real(backend, a, b, 1)[0][0], 1.0
+        return [(dy, dx, dz + 3)], sharp
+
+    monkeypatch.setattr(refine3d, "peaks", three_planes_off)
+    cfg3.refine.max_shift_z = 5
+    gt, tiles, meta = make_mosaic()
+
+    monkeypatch.setattr(refine3d, "CLIMB", 2)
+    _, log = register(cfg3, tiles, meta)
+    unsettled = [p for p in log["pairs"] if "no settled match within 2 steps" in p["reason"]]
+    assert len(unsettled) >= 5
+    assert all(tuple(p["shift"]) == relative(p) for p in log["pairs"] if p["accepted"])
+
+    monkeypatch.setattr(refine3d, "CLIMB", 16)
+    corr, log = register(cfg3, tiles, meta)
+    assert corr == PERT3 and log["n_accepted"] >= log["n_pairs"] - 2
 
 
 def test_a_z_offset_beyond_max_shift_z_is_rejected_not_clipped(cfg3):
@@ -188,11 +231,46 @@ def test_a_z_offset_beyond_max_shift_z_is_rejected_not_clipped(cfg3):
     gt, tiles, meta = make_mosaic(Z_ONLY)
     corr, log = register(cfg3, tiles, meta)
     for p in log["pairs"]:
-        relative_dz = abs(Z_ONLY[p["j"]][2] - Z_ONLY[p["i"]][2])
-        assert p["accepted"] == (relative_dz <= 1), p
-        if relative_dz > 1:
+        dz = abs(relative(p, Z_ONLY)[2])
+        assert p["accepted"] == (dz <= 1), p
+        if dz > 1:
             assert "exceeds the +/-1 plane(s) searched" in p["reason"]
     assert log["max_shift_z"] == 1
+
+
+def test_an_offset_one_plane_past_the_range_is_not_accepted_at_its_edge(cfg3):
+    """Found on a real CZI. A slab of 8 planes searches +/-3, and for a pair 4 planes
+    apart the strongest peak inside that range sits at 3: a real improvement on the
+    stage position, so it was accepted, a plane short. The walk now steps on to 4,
+    finds it better, and the pair is rejected as out of range."""
+    cfg3.refine.slab, cfg3.refine.planes = 8, 1
+    gt, tiles, meta = make_mosaic()
+    corr, log = register(cfg3, tiles, meta)
+    assert log["max_shift_z"] == 3
+    for p in log["pairs"]:
+        want = relative(p)
+        if abs(want[2]) > 3:
+            assert not p["accepted"] and "exceeds the +/-3 plane(s) searched" in p["reason"]
+        else:
+            assert p["accepted"] and tuple(p["shift"]) == want, p
+    assert corr == PERT3 and log["rms_residual_z"] == 0
+
+
+def test_a_sliver_of_overlap_is_not_scored(cfg3):
+    """An overlap too small to attempt is too small to score: a few pixels of it can
+    match anything, and a walk must not be able to end there."""
+    gt, tiles, meta = make_mosaic(XY_ONLY)
+    for c in refine3d.candidates(meta, 32, 100):
+        (va, vb), = refine3d.load(lambda z, m: tiles[m][z], list(range(NZ)), [c], np.uint16)
+        oy, ox = c["overlap"]
+        if oy == ox:
+            continue                                          # corners: either axis would do
+        # tile j is the lower or right-hand one, so moving it further that way narrows
+        # the 64 px they share
+        thin = (33, 0, 0) if oy < ox else (0, 33, 0)          # leaves 31 px
+        okay = (32, 0, 0) if oy < ox else (0, 32, 0)          # leaves 32
+        assert refine3d.score(c, va, vb, thin) == 0.0
+        assert refine3d.score(c, va, vb, okay) != 0.0
 
 
 def test_the_search_along_z_is_limited_by_the_slab(cfg3):
@@ -361,14 +439,19 @@ def test_a_single_slab_gives_no_depth_report(cfg3):
 
 # ---------------------------------------------------------------- memory
 class _CountingAics:
+    """Counts tile reads, which now arrive from several threads at once."""
+
     def __init__(self, inner):
+        import threading
         self.inner, self.dims, self.reads = inner, inner.dims, 0
+        self.lock = threading.Lock()
 
     def get_dims_shape(self):
         return self.inner.get_dims_shape()
 
     def read_image(self, **kw):
-        self.reads += 1
+        with self.lock:
+            self.reads += 1
         return self.inner.read_image(**kw)
 
 
@@ -402,12 +485,45 @@ def test_a_single_pair_over_budget_is_still_measured():
         [pair, pair], [pair]]
 
 
+def test_threads_do_not_change_the_answer(cfg3):
+    """Tiles are read and pairs measured on several threads. Each pair belongs to one
+    thread at a time, so the record must be the same however many there are."""
+    gt, tiles, meta = make_mosaic(noise=2000)
+    logs = []
+    for n in (1, 2, 8):
+        cfg3.n_read_threads = n
+        corr, log = register(cfg3, tiles, meta)
+        assert corr == PERT3
+        logs.append(json.dumps(log, sort_keys=True))
+    assert logs[0] == logs[1] == logs[2]
+
+
+def test_a_large_overlap_is_scored_on_a_lattice():
+    assert [refine3d.score_step(v) for v in (0, 3_999_999, 4_000_000, 15_999_999,
+                                             16_000_000, 10**9)] == [1, 1, 2, 2, 4, 8]
+
+
+def test_lattice_scores_agree_with_full_ones(cfg3):
+    """What the lattice is for: a quarter (or a sixteenth) of the voxels, the same NCC to
+    well inside min_gain, and the same ordering of the shifts being compared."""
+    gt, tiles, meta = make_mosaic(noise=800)
+    c = refine3d.candidates(meta, 32, 100)[0]
+    (va, vb), = refine3d.load(lambda z, m: tiles[m][z], list(range(NZ)), [c], np.uint16)
+    true = tuple(b - a for a, b in zip(PERT3[c["i"]], PERT3[c["j"]]))
+    shifts = [true, (0, 0, 0), (true[0] + 1, true[1], true[2]), (true[0], true[1], true[2] + 1)]
+    full = [refine3d.score(c, va, vb, s) for s in shifts]
+    for step in (2, 4):
+        coarse = [refine3d.score(dict(c, step=step), va, vb, s) for s in shifts]
+        assert max(abs(a - b) for a, b in zip(full, coarse)) < 0.01
+        assert np.argsort(coarse).tolist() == np.argsort(full).tolist()
+
+
 def test_scoring_on_the_kept_pieces_matches_scoring_on_whole_tiles(cfg3):
     """Only the overlap grown by max_shift is held, on the claim that this loses nothing
     for any shift within max_shift. Checked against the 2D score on the whole tiles."""
     gt, tiles, meta = make_mosaic(XY_ONLY)
     for c in refine3d.candidates(meta, 32, 20):
-        (va, vb), = refine3d.load(lambda z, m: tiles[m][z], [5], [c])
+        (va, vb), = refine3d.load(lambda z, m: tiles[m][z], [5], [c], np.uint16)
         for d in [(0, 0), (20, -20), (-20, 20), (7, -13), (-20, -20)]:
             want = refine.score(tiles[c["i"]][5], meta[c["i"]], tiles[c["j"]][5], meta[c["j"]], d)
             assert refine3d.score(c, va, vb, d + (0,)) == pytest.approx(want, abs=1e-6)
@@ -636,3 +752,46 @@ def test_phase_correlation_of_planes_is_unchanged():
     R /= np.maximum(np.abs(R), 1e-12)
     assert np.array_equal(Backend(False).fft_phase_correlation(a, b),
                           np.fft.irfft2(R, s=a.shape))
+
+
+# ---------------------------------------------------------------- the GPU path
+def gpu_stand_in():
+    """A Backend whose GPU branch runs, with numpy standing in for CuPy.
+
+    There is no CUDA device to run the real thing on here, and until this the branch had
+    never been executed for a volume at all. It exercises the branch's own logic (the
+    window, the axes, the dtypes, the lock under threads), not the device or CuPy itself.
+    """
+    import types
+
+    backend = Backend(False)
+    backend.cp = types.SimpleNamespace(asarray=np.asarray, asnumpy=np.asarray, fft=np.fft,
+                                       conj=np.conj, maximum=np.maximum, abs=np.abs)
+    backend.gpu = True
+    return backend
+
+
+def test_gpu_branch_correlates_a_volume_as_the_cpu_one_does():
+    rng = np.random.default_rng(0)
+    a = rng.normal(size=(12, 48, 40)).astype(np.float32)
+    b = np.roll(a, (-2, 5, -3), axis=(0, 1, 2))
+    on_gpu = gpu_stand_in().fft_phase_correlation(a, b)
+    on_cpu = Backend(False).fft_phase_correlation(a, b)
+    assert on_gpu.shape == on_cpu.shape == a.shape
+    assert np.unravel_index(on_gpu.argmax(), a.shape) == (2, 43, 3)      # (2, -5, 3)
+    assert np.allclose(on_gpu, on_cpu, atol=1e-4)
+
+
+def test_gpu_branch_correlates_planes_as_the_cpu_one_does():
+    rng = np.random.default_rng(1)
+    a = rng.integers(0, 60000, (96, 64)).astype(np.uint16)
+    b = rng.integers(0, 60000, (96, 64)).astype(np.uint16)
+    assert np.allclose(gpu_stand_in().fft_phase_correlation(a, b),
+                       Backend(False).fft_phase_correlation(a, b), rtol=0, atol=1e-12)
+
+
+def test_registration_through_the_gpu_branch(cfg3):
+    gt, tiles, meta = make_mosaic(noise=800)
+    corr, log = refine3d.register(source(cfg3, tiles), cfg3, gpu_stand_in(), None, meta,
+                                  {"T": 0, "Z": NZ // 2, "C": 0})
+    assert corr == PERT3 and log["n_accepted"] == log["n_pairs"]

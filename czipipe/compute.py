@@ -84,6 +84,12 @@ class Backend:
         volume is transformed in single precision: the peak is what matters, and at full
         resolution an overlap volume is large enough that doubling it shows in the RAM.
         """
+        if np.ndim(a) > 2 and not self.gpu:
+            # One volume at a time. The transform already runs across every core, and
+            # several at once, from threads measuring different pairs, would multiply
+            # the working memory for no gain.
+            with self._lock:
+                return self._volume_correlation(a, b)
         a = np.asarray(a, np.float32)
         b = np.asarray(b, np.float32)
         a = a - a.mean()
@@ -100,23 +106,30 @@ class Backend:
                 R = cp.fft.rfftn(ga * gw) * cp.conj(cp.fft.rfftn(gb * gw))
                 R /= cp.maximum(cp.abs(R), 1e-12)
                 return cp.asnumpy(cp.fft.irfftn(R, s=a.shape, axes=tuple(range(a.ndim))))
-        if a.ndim == 2:
-            R = np.fft.rfft2(a * win) * np.conj(np.fft.rfft2(b * win))
-            R /= np.maximum(np.abs(R), 1e-12)
-            return np.fft.irfft2(R, s=a.shape)
-        # A volume: work in place where possible, and across cores when scipy is there
-        # to do it (numpy's FFT is single-threaded).
-        a *= win
-        b *= win
+        R = np.fft.rfft2(a * win) * np.conj(np.fft.rfft2(b * win))
+        R /= np.maximum(np.abs(R), 1e-12)
+        return np.fft.irfft2(R, s=a.shape)
+
+    @staticmethod
+    def _volume_correlation(a, b):
+        """The CPU path for volumes: in place where possible, and across cores when scipy
+        is there to do it (numpy's FFT is single-threaded)."""
         rfftn, irfftn, kw = np.fft.rfftn, np.fft.irfftn, {}
         try:
             from scipy import fft as sfft
             rfftn, irfftn, kw = sfft.rfftn, sfft.irfftn, {"workers": -1}
         except ImportError:
             pass
-        R = rfftn(a, **kw)
-        del a
-        R *= np.conj(rfftn(b, **kw))
-        del b
+        shape, spectra = np.shape(a), []
+        for v in (a, b):
+            v = np.array(v, np.float32)                  # a copy: windowed in place below
+            v -= v.mean()
+            for axis, n in enumerate(shape):             # separable Hann, no window volume
+                v *= np.hanning(n).astype(np.float32).reshape(
+                    [-1 if k == axis else 1 for k in range(len(shape))])
+            spectra.append(rfftn(v, **kw))
+            del v
+        R = spectra[0]
+        R *= np.conj(spectra.pop())
         R /= np.maximum(np.abs(R), 1e-12)
-        return irfftn(R, s=win.shape, axes=tuple(range(win.ndim)), **kw)
+        return irfftn(R, s=shape, axes=tuple(range(len(shape))), **kw)

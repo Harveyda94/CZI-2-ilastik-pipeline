@@ -409,8 +409,9 @@ correlates each overlap as a volume and gives every tile a Z correction as well,
 whole planes; each tile is then taken from the plane that belongs at the one being
 written. It reads far more of the file to register (every tile once per plane of every
 slab), and the first and last few output planes can lack the tiles whose offset reaches
-past the end of the stack. It has been tested on synthetic data only so far, so check
-the preview at a few depths before a long run.
+past the end of the stack. It is tested on real CZI files, but only ones written from
+synthetic volumes, so on microscope data check the preview at a few depths before a
+long run.
 
 **Flat-field correction is per field of view**, so it only works where individual fields
 are still separable. On a mosaic that means the per-tile path: `refine`, `bigstitcher`,

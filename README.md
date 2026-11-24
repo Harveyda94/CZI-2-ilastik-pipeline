@@ -181,12 +181,21 @@ Z offset says belongs at the plane being written.
   stack too shallow for that many gets as many as fit. At most `(slab - 1) // 2` planes
   of Z offset are searched, so a thin slab limits `max_shift_z`; the report states the
   range actually searched.
+- **How a shift is found.** Phase correlation only proposes: its five strongest distinct
+  peaks, and the stage position itself. Each is scored by the NCC of the two overlap
+  volumes, and the best is then walked a step at a time, in X, Y or Z, to where the
+  match stops improving. The shift kept is therefore one that no neighbouring step
+  beats, which is what gets the last pixel or plane right under noise. A proposal that
+  was wrong is walked to the true shift or rejected, never accepted as proposed, and an
+  offset beyond the search range walks out of it and is rejected rather than accepted a
+  step short at its edge.
 - **What is accepted.** As in 2D, a shift must match well (`min_ncc`) and measurably
   better than the stage position (`min_gain`). The XY part and the Z part are each held
   to that on their own: a Z offset is kept only if it beats the same XY shift without
   it, and the other way about. Without that, getting one right carries the other through
   with it, wrong sign included. A pair that matches best where the stage already put it
   is kept as a weak constraint, so tiles the stage has right hold each other in place.
+  A shift that would leave less than `min_overlap` of overlap is not scored at all.
 - **What Z corrections are relative to.** XY is pinned at the first tile, as in 2D. Along
   Z the median tile keeps its own planes, so as few stacks as possible are moved.
 - **The ends of the stack.** The output has the planes you selected and no others. A
@@ -216,11 +225,14 @@ with depth, and is reported, not corrected.
 the defaults, against 5 in 2D). Some are read again: where a pair's slabs proposed
 shifts the others had not already scored, and where the overlap volumes do not all fit
 `mosaic_cache_mb` at once, since pairs are then measured in batches and the tiles shared
-between batches are read for each. Memory is that cap plus the working set for one
-pair. In a synthetic benchmark with 1920 px tiles and 10% overlap, a pair took about a
-quarter of a second per slab on an 18-core Mac, and six tiles peaked about 0.4 GB above
-where they started. `.stitch.json` records every pair's shift in every slab, and
-corrections as `[dy, dx, dz]`.
+between batches are read for each. Tiles are read and pairs measured on the run's read
+threads (`n_read_threads`); the record is the same however many there are. Memory is
+that cap plus one volume transform, whatever the thread count. In a synthetic benchmark
+with 1920 px tiles and 10% overlap, a pair took 29 ms per slab on 8 threads (68 ms on
+one), and memory peaked about 140 MB above the overlap volumes held. A large overlap is
+scored on a lattice of at least a million voxels rather than on all of them. On a slow
+disk the reads will dominate. `.stitch.json` records every pair's shift in every slab,
+and corrections as `[dy, dx, dz]`.
 
 ## Interrupting and restarting
 
@@ -282,7 +294,7 @@ Every stage can be interrupted and re-run; nothing that finished is redone.
 ## Tests
 
 ```bash
-python -m pytest                  # 311 tests
+python -m pytest                  # 326 tests
 python tools/minipytest.py        # if pytest is unavailable
 ```
 
@@ -306,14 +318,26 @@ which point a single plane has lost a third of its pairs.
 
 3D registration is checked on a synthetic volume whose tiles are cut at known XY and Z
 offsets. It recovers every offset exactly, and over 6 seeds still does at a noise sd of
-300; at 800 and 2000 the worst tile is one pixel out in XY, with Z still exact. The
-composite then equals the truth at every plane, seams included, while the same XY
-corrections without the Z ones do not. The guards are tested by breaking the convention on purpose: with the Z sign
-inverted no tile is moved along Z, and with the XY sign inverted the mirror of a true
-shift is never accepted. Also covered: a Z offset beyond `max_shift_z` is rejected
-rather than clipped, a featureless slab, an offset that changes with depth, batches
-under a small memory cap giving the identical result, and an output's fingerprint
+2000; at 4000, where the noise is as large as the signal, 52 of 54 tiles are exact and
+none is out by more than one step. The composite then equals the truth at every plane,
+seams included, while the same XY corrections without the Z ones do not. That the NCC
+decides, and not the correlation peak, is tested by handing the measurement wrong
+proposals on purpose (Z sign inverted, XY sign inverted, both, 40 px off): none is
+accepted as proposed, and 17 to 19 of the 20 pairs still end exactly right. Also
+covered: a Z offset beyond `max_shift_z` is rejected rather than clipped, including one
+a single plane past the range; a walk that never settles; a sliver of overlap; a
+featureless slab; an offset that changes with depth; batches under a small memory cap,
+and any number of threads, giving the identical record; and an output's fingerprint
 changing only when a tile actually moves along Z.
+
+`tests/test_real_czi.py` is the exception to the fakes: it writes a mosaic CZI with
+pylibCZIrw and takes it through the real `Source` and aicspylibczi, in 2D and in 3D, to
+a verified TIFF that equals the truth at every plane. It is skipped where those
+libraries are missing. The pixels are still synthetic.
+
+Both runners take every test: `tools/minipytest.py` accepts one `parametrize` per test
+and has no `importorskip`, so a test that needs two parameters lists their product, and
+one that needs a library skips itself when the import fails.
 
 Flat-field is checked against a known synthetic vignette: the estimator recovers it to
 under 0.05 worst-pixel, correction reduces residual shading error by more than 3x, and
@@ -394,11 +418,14 @@ Found by review rather than in the field:
   planes. In either mode an offset that changes with depth (a tilted or sheared tile) is
   reported by the depth check and not corrected; with only two usable planes that
   disagree, the tile is left between the two. No chromatic correction.
-- **3D registration has only been run on synthetic data**, not yet on a real CZI. Look at
-  `preview()` and the report before a long conversion. It does not interpolate between
-  planes, so a true half-plane offset is corrected to the nearer whole plane, and it
-  does not add planes: the first and last few output planes can lack the tiles whose
-  offset reaches past the end of the stack. `bigstitcher` mode still applies XY only.
+- **3D registration has not been run on microscope data.** It is tested end to end on a
+  real CZI file, but one written here from a synthetic volume. Its GPU path has only
+  been run with numpy standing in for CuPy, which checks the code and not the device.
+  Look at `preview()` and the report before a long conversion. It does not interpolate
+  between planes, so a true half-plane offset is corrected to the nearer whole plane,
+  and it does not add planes: the first and last few output planes can lack the tiles
+  whose offset reaches past the end of the stack. `bigstitcher` mode still applies XY
+  only.
 - **`bigstitcher` mode is translation-only**, and refuses rotation, shear, multi-angle and
   multi-illumination rather than dropping them silently.
 - **TIFF cannot resume mid-file.** Sequential format; an interrupted TIFF starts again

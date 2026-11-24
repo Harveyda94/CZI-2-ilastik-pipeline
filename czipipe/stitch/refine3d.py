@@ -6,19 +6,25 @@ wrong planes however good its XY fit. This is the alternative, `refine.mode = "3
 overlapping pair is phase-correlated as a volume, over a run of consecutive Z planes (a
 slab) of the overlap, which gives (dy, dx, dz) in one measurement.
 
-The 2D guard applies here too, and for the same reason. Every candidate shift is scored
-by the NCC of the two overlap volumes at that shift and at none, and is kept only if it
-matches measurably better than the stage positions do, so a sign or axis-order error
-rejects the pairs it touches instead of quietly mirroring the mosaic. The XY and Z
-parts are each held to that standard on their own, because getting one right raises the
-NCC enough to carry the other past a test against the stage positions alone, wrong sign
-included: a Z offset is kept only if it matches measurably better than the same XY shift
-without it, and an XY shift only if it beats the same Z offset without it. A pair the
-stage already has right says so too: where the best match is at no shift at all, that is
-kept as a (weak) constraint rather than thrown away.
+Phase correlation only proposes. Its strongest peaks, and the stage position itself, are
+scored by the NCC of the two overlap volumes, and the best of them is walked a step at a
+time to where the match stops improving, so the shift kept is one that no neighbouring
+step beats. A proposal of the wrong sign, or nowhere near, is thereby walked to the true
+shift or rejected; it is never accepted as proposed.
+
+The 2D guard applies here too: a shift is kept only if it matches measurably better than
+the stage positions do. The XY and Z parts are each held to that standard on their own,
+because getting one right raises the NCC enough to carry the other past a test against
+the stage positions alone, wrong sign included: a Z offset is kept only if it matches
+measurably better than the same XY shift without it, and an XY shift only if it beats
+the same Z offset without it. A pair the stage already has right says so too: where the
+best match is at no shift at all, that is kept as a (weak) constraint rather than thrown
+away.
 
 Memory stays bounded. A measurement needs only the overlap of its two tiles, over one
 slab, and pairs are measured in batches whose volumes fit `mosaic_cache_mb` together.
+Tiles are read and pairs measured on the run's read threads, with one volume transform
+running at a time.
 
 It is still one translation per tile. Several slabs are measured so that one featureless
 depth does not lose a pair, and the report says where slabs disagree, but a tile that is
@@ -27,11 +33,18 @@ tilted or sheared against its neighbour is reported, not corrected.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 
 from .refine import choose, ncc, overlap_slices
 
-PEAKS = 5             # correlation peaks tried per measurement, strongest first
+PEAKS = 5             # distinct correlation peaks tried per measurement, strongest first
+SUPPRESS = 2          # voxels either side of a peak in which the next is not sought
+CLIMB = 16            # steps a proposal may be walked towards a better match
+STEPS = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+SCORE_VOXELS = 1_000_000    # an NCC over this many samples is settled; a larger overlap
+                            # is scored on a lattice holding at least this many
 AGREE = 1             # shifts are integers, so a true half-step reads as either side
 MIN_DEPTH = 3         # planes in a slab; fewer cannot tell a Z offset from none
 ZERO = (0, 0, 0)
@@ -93,7 +106,7 @@ def candidates(rects, min_overlap, pad):
                 kept.append((kx0, ky0, kx1 - kx0, ky1 - ky0))
                 cuts.append((slice(ky0 - y, ky1 - y), slice(kx0 - x, kx1 - x)))
             out.append({"i": mi, "j": mj, "overlap": [int(y1 - y0), int(x1 - x0)],
-                        "rects": kept, "cut": cuts,
+                        "rects": kept, "cut": cuts, "least": min_overlap,
                         "core": overlap_slices(kept[0], kept[1]),   # the overlap itself
                         "area": sum(k[2] * k[3] for k in kept), "obs": []})
     return out
@@ -118,114 +131,180 @@ def batches(cands, depth, itemsize, budget):
     return out
 
 
-def load(read, slab, batch, progress=None):
+def load(read, slab, batch, dtype, pool=None, progress=None):
     """[(va, vb)] per pair of `batch`: its two pieces as (Z, Y, X) volumes over `slab`.
 
     Each tile the batch touches is read once per plane and cut for every pair it is in,
-    so only one whole tile is in memory at a time.
+    so a whole tile is held only while it is being cut. With `pool` the reads run on its
+    threads; every (plane, tile) fills slots of its own, so they need no ordering.
     """
-    uses = {}
+    uses, vols = {}, []
     for n, c in enumerate(batch):
+        vols.append([np.empty((len(slab), r[3], r[2]), dtype) for r in c["rects"]])
         for side, m in enumerate((c["i"], c["j"])):
             uses.setdefault(m, []).append((n, side, c["cut"][side]))
-    vols = [[None, None] for _ in batch]
-    todo = [(k, z, m) for k, z in enumerate(slab) for m in sorted(uses)]
-    for k, z, m in (progress(todo) if progress else todo):
+
+    def fetch(job):
+        k, z, m = job
         tile = read(z, m)
         for n, side, cut in uses[m]:
-            piece = tile[cut]
-            if vols[n][side] is None:
-                vols[n][side] = np.empty((len(slab),) + piece.shape, piece.dtype)
-            vols[n][side][k] = piece
+            vols[n][side][k] = tile[cut]
+
+    todo = [(k, z, m) for k, z in enumerate(slab) for m in sorted(uses)]
+    done = pool.map(fetch, todo) if pool else map(fetch, todo)
+    for _ in (progress(done, len(todo)) if progress else done):
+        pass
     return vols
 
 
 # ---------------------------------------------------------------- one measurement
 def peaks(backend, a, b, n=PEAKS):
-    """The `n` strongest phase-correlation peaks as shifts, plus a peak-sharpness score.
+    """Up to `n` distinct phase-correlation peaks as shifts, strongest first, and a
+    peak-sharpness score.
 
     A shift s = (dy, dx, dz) means b[k, i, j] ~ a[k + dz, i + dy, j + dx]: it is how far
     tile b has to move, in pixels and planes, to line up with tile a. XY first, so that
     the first two components mean what a 2D correction's two do.
+
+    Distinct, because each peak blanks the voxels within SUPPRESS of it before the next
+    is sought: the list is `n` different hypotheses, not one peak and its shoulders.
+    Where exactly a peak's best match lies is settled by NCC, in `measure`.
     """
     cc = backend.fft_phase_correlation(a, b)
-    flat = cc.ravel()
-    n = min(n, flat.size)
-    top = np.argpartition(flat, -n)[-n:]
-    top = top[np.argsort(flat[top])[::-1]]
-    out = []
-    for p in top:
+    floor = float(np.abs(cc).mean())
+    out, top = [], None
+    for _ in range(n):
+        idx = np.unravel_index(int(cc.argmax()), cc.shape)
+        value = float(cc[idx])
+        if not np.isfinite(value):
+            break                                        # nothing left that is not blanked
+        top = value if top is None else top
         sz, sy, sx = (int(v) - size if v > size // 2 else int(v)
-                      for v, size in zip(np.unravel_index(p, cc.shape), cc.shape))
+                      for v, size in zip(idx, cc.shape))
         out.append((sy, sx, sz))
-    return out, float(flat[top[0]] / (np.abs(cc).mean() + 1e-12))
+        cc[np.ix_(*(np.arange(v - SUPPRESS, v + SUPPRESS + 1) % size
+                    for v, size in zip(idx, cc.shape)))] = -np.inf
+    return out, top / (floor + 1e-12)
+
+
+def score_step(voxels):
+    """The XY stride an overlap of `voxels` is scored at.
+
+    The largest power of two (8 at most) that still leaves SCORE_VOXELS samples. An NCC
+    over a million samples does not move in the third decimal place when given four
+    million, and the scoring is most of the work of a measurement.
+    """
+    step = 1
+    while step < 8 and voxels // (4 * step * step) >= SCORE_VOXELS:
+        step *= 2
+    return step
 
 
 def score(c, va, vb, s):
-    """NCC of the pair's volumes with tile j moved by s, over everything they then share."""
+    """NCC of the pair's volumes with tile j moved by s, over everything they then share.
+
+    Zero where that is less than min_overlap across: an overlap too small to attempt is
+    too small to score, and a sliver of one can match anything.
+    """
     sl = overlap_slices(c["rects"][0], c["rects"][1], s[:2])
     lo, hi = max(0, -s[2]), va.shape[0] - max(0, s[2])
     if sl is None or hi <= lo:
         return 0.0
-    return ncc(va[(slice(lo + s[2], hi + s[2]),) + sl[0]], vb[(slice(lo, hi),) + sl[1]])
+    (ya, xa), (yb, xb) = sl
+    if min(ya.stop - ya.start, xa.stop - xa.start) < c.get("least", 1):
+        return 0.0
+    step = c.get("step", 1)
+    if step > 1:
+        # A lattice fixed in tile i, so that two shifts are compared on the same voxels
+        # of it wherever their overlaps coincide.
+        oy, ox = -ya.start % step, -xa.start % step
+        if ya.start + oy >= ya.stop or xa.start + ox >= xa.stop:
+            return 0.0
+        ya, yb = slice(ya.start + oy, ya.stop, step), slice(yb.start + oy, yb.stop, step)
+        xa, xb = slice(xa.start + ox, xa.stop, step), slice(xb.start + ox, xb.stop, step)
+    return ncc(va[slice(lo + s[2], hi + s[2]), ya, xa], vb[slice(lo, hi), yb, xb])
 
 
 def measure(backend, rc, max_z, c, va, vb):
     """One pair in one slab: the shift it supports, and how that scores against metadata.
 
-    Phase correlation only proposes. Its strongest peaks that are within bounds are each
-    scored by NCC and the best match wins, which is what settles a peak split between
-    neighbouring planes or pixels. `reason` is empty when the slab is usable: either the
-    winner matches well enough and measurably better than the stage position, or nothing
-    beats the stage position and that itself matches well (a shift of zero). `at` holds
-    this slab's NCC at every shift scored on it, and `dropped` the part of the winning
-    peak (its Z offset, or its XY shift) that did not match measurably better than none.
+    Phase correlation only proposes, and NCC decides. The best-matching proposal (one of
+    the correlation peaks, or the stage position) is walked a step at a time to where the
+    match stops improving, so the shift kept is one that no neighbouring step beats. That
+    settles a peak split between neighbouring pixels or planes, which under noise phase
+    correlation gets wrong more often than not. It also means an offset beyond the search
+    range walks out of it and is rejected, where taking the strongest peak inside the
+    range would accept it a step short, at the boundary. A walk still improving after
+    CLIMB steps started nowhere near a match, and is rejected too rather than kept
+    wherever it had got to.
+
+    `reason` is empty when the slab is usable: either that shift matches well enough and
+    measurably better than the stage position, or the walk ends on the stage position
+    (or a step from it, for no measurable gain) and that itself matches well: a shift of
+    zero. `at` holds this slab's NCC at every shift scored on it, and `dropped` the part
+    of the shift (its Z offset, or its XY part) that did not match measurably better
+    than none.
     """
     whole = (slice(None),)
-    proposed, sharp = peaks(backend, va[whole + c["core"][0]], vb[whole + c["core"][1]])
-    base = score(c, va, vb, ZERO)
-    at = {ZERO: base}
+    found, sharp = peaks(backend, va[whole + c["core"][0]], vb[whole + c["core"][1]])
+    at = {}
+
+    def ncc_at(p):
+        if p not in at:
+            at[p] = score(c, va, vb, p)
+        return at[p]
 
     def within(p):
         return max(abs(p[0]), abs(p[1])) <= rc.max_shift and abs(p[2]) <= max_z
 
-    # A strongest peak out of bounds means the implied correction is too large, and the
-    # measurement is rejected for it. Falling back on a weaker peak that happens to be in
-    # bounds would clip the correction instead: a step towards the real offset, taken as
-    # if it were the whole of it.
-    inside = [p for p in proposed if within(p)] if within(proposed[0]) else []
-    for p in inside:
-        if p not in at:
-            at[p] = score(c, va, vb, p)
-    s = max(inside, key=at.get) if inside else None        # ties: the stronger peak
-    dropped = None
-    if s is not None and s[2] and (s[0] or s[1]):
-        # Each part of the shift has to earn its place against the same shift without
-        # it. Scored against the stage positions alone, getting XY right would carry any
-        # Z offset through with it, the wrong way included, and the other way about.
-        flat, lift = (s[0], s[1], 0), (0, 0, s[2])
-        for part in (flat, lift):
-            if part not in at:
-                at[part] = score(c, va, vb, part)
-        if at[s] < max(at[flat], at[lift]) + rc.min_gain:
-            dropped = ("z", s[2]) if at[flat] >= at[lift] else ("xy", list(s[:2]))
-            s = flat if at[flat] >= at[lift] else lift
-    got = None if s is None else at[s]
+    def beyond(p):
+        return (f"shift exceeds max_shift ({rc.max_shift} px)"
+                if max(abs(p[0]), abs(p[1])) > rc.max_shift
+                else f"Z shift exceeds the +/-{max_z} plane(s) searched "
+                     "(refine.max_shift_z, and no more than a slab can vouch for)")
 
-    if s is None:
-        first = proposed[0]
-        reason = (f"shift exceeds max_shift ({rc.max_shift} px)"
-                  if max(abs(first[0]), abs(first[1])) > rc.max_shift
-                  else f"Z shift exceeds the +/-{max_z} plane(s) searched "
-                       "(refine.max_shift_z, and no more than a slab can vouch for)")
-    elif s != ZERO and got >= rc.min_ncc and got >= base + rc.min_gain:
-        reason = ""
-    elif (s == ZERO or ZERO in inside) and base >= rc.min_ncc:
-        s, got, reason = ZERO, base, ""
-    elif got < rc.min_ncc:
-        reason = f"ncc {got:.3f} < min_ncc"
+    # The stage position is a proposal too. Where it already matches better than any
+    # peak, the walk starts from it, and finds a small real offset without the peaks'
+    # help; where the walk stays on it, the pair confirms the stage.
+    base = ncc_at(ZERO)
+    s = max([p for p in found if within(p)] + [ZERO], key=ncc_at)     # ties: peaks first
+    settled = False
+    for _ in range(CLIMB):
+        step = max(((s[0] + d[0], s[1] + d[1], s[2] + d[2]) for d in STEPS), key=ncc_at)
+        if ncc_at(step) <= ncc_at(s):
+            settled = True
+            break
+        s = step
+        if not within(s):
+            break
+
+    dropped, got, best = None, None, s
+    if not within(s):
+        s, reason = None, beyond(s)
+    elif not settled:
+        got = at[s]                              # still improving: nowhere near a match
+        reason = f"no settled match within {CLIMB} steps of any proposal"
     else:
-        reason = f"no gain over metadata ({got:.3f} vs {base:.3f})"
+        if s[2] and (s[0] or s[1]):
+            # Each part of the shift has to earn its place against the same shift without
+            # it. Scored against the stage positions alone, getting XY right would carry
+            # any Z offset through with it, the wrong way included, and the other way
+            # about.
+            flat, lift = (s[0], s[1], 0), (0, 0, s[2])
+            if ncc_at(s) < max(ncc_at(flat), ncc_at(lift)) + rc.min_gain:
+                dropped = ("z", s[2]) if at[flat] >= at[lift] else ("xy", list(s[:2]))
+                s = flat if at[flat] >= at[lift] else lift
+        got = at[s]
+        if s != ZERO and got >= rc.min_ncc and got >= base + rc.min_gain:
+            reason = ""
+        elif base >= rc.min_ncc and _apart(best, ZERO) <= AGREE:
+            s, got, reason = ZERO, base, ""      # the best match is where the stage put it
+        elif not within(found[0]):
+            reason = beyond(found[0])            # the peak that mattered was out of range
+        elif got < rc.min_ncc:
+            reason = f"ncc {got:.3f} < min_ncc"
+        else:
+            reason = f"no gain over metadata ({got:.3f} vs {base:.3f})"
     return {"shift": s, "sharpness": sharp, "base": base, "got": got, "at": at,
             "dropped": dropped, "reason": reason, "status": "unusable"}
 
@@ -342,23 +421,16 @@ def register(source, cfg, backend, scene_id, rects, ref_plane, progress=None, sl
         kw["S"] = scene_id
 
     def read(z, m):
-        return np.squeeze(czi.read_image(M=m, Z=z, **kw)[0])
+        # source.aics() is per thread, which is what lets the reads run on several
+        return np.squeeze(source.aics().read_image(M=m, Z=z, **kw)[0])
 
     ms = sorted(rects)
     cands = candidates(rects, rc.min_overlap, rc.max_shift)
     budget = cfg.mosaic_cache_mb * 1e6
-    itemsize = np.dtype(source.dtype).itemsize
-
-    def volumes(k, group):
-        """(pair, va, vb) for each pair of `group` in slab k, a bounded batch at a time."""
-        bar = None
-        if progress:
-            def bar(todo):
-                return progress(todo, desc=f"register Z {slabs[k][0]}-{slabs[k][-1]}",
-                                leave=False)
-        for batch in batches(group, len(slabs[k]), itemsize, budget):
-            for c, (va, vb) in zip(batch, load(read, slabs[k], batch, bar)):
-                yield c, va, vb
+    dtype = np.dtype(source.dtype)
+    for c in cands:
+        c["step"] = score_step(c["overlap"][0] * c["overlap"][1] * depth)
+        c["proposed"] = []                       # distinct shifts, in the order proposed
 
     def fill(c, o, va, vb):
         """Score, in this slab, every shift the pair's slabs have proposed so far."""
@@ -366,10 +438,8 @@ def register(source, cfg, backend, scene_id, rects, ref_plane, progress=None, sl
             if s not in o["at"]:
                 o["at"][s] = score(c, va, vb, s)
 
-    for c in cands:
-        c["proposed"] = []                       # distinct shifts, in the order proposed
-    for k in range(len(slabs)):
-        for c, va, vb in volumes(k, cands):
+    def first_look(k):
+        def job(c, va, vb):
             o = measure(backend, rc, max_z, c, va, vb)
             o["slab"] = k
             c["obs"].append(o)
@@ -377,21 +447,40 @@ def register(source, cfg, backend, scene_id, rects, ref_plane, progress=None, sl
                 if o["shift"] not in c["proposed"]:
                     c["proposed"].append(o["shift"])
                 fill(c, o, va, vb)
+        return job
 
-    # The choice between a pair's proposals rests on how well each fits every usable
-    # slab, so each proposal has to be scored in each of them. A slab has already scored
-    # its own strongest peaks and whatever earlier slabs proposed, which usually covers
-    # it: slabs mostly disagree by a step, and the neighbouring step is one of those
-    # peaks. Only what is still missing costs a second read.
-    missing = {}
-    for c in cands:
-        for o in c["obs"]:
-            if not o["reason"] and any(s not in o["at"] for s in c["proposed"]):
-                missing.setdefault(o["slab"], []).append((c, o))
-    for k, items in sorted(missing.items()):
-        waiting = {id(c): o for c, o in items}
-        for c, va, vb in volumes(k, [c for c, _ in items]):
-            fill(c, waiting[id(c)], va, vb)
+    # Tiles are read, and pairs measured, on the run's read threads. A pair is only ever
+    # touched by the one thread measuring it, and slabs are taken in turn, so the result
+    # does not depend on how the threads are scheduled.
+    with ThreadPoolExecutor(max(1, cfg.read_threads)) as pool:
+        def each(k, group, job):
+            """job(pair, va, vb) for every pair of `group` on its volumes in slab k,
+            a batch that fits the memory budget at a time."""
+            bar = None
+            if progress:
+                def bar(jobs, total):
+                    return progress(jobs, total=total, leave=False,
+                                    desc=f"register Z {slabs[k][0]}-{slabs[k][-1]}")
+            for batch in batches(group, len(slabs[k]), dtype.itemsize, budget):
+                vols = load(read, slabs[k], batch, dtype, pool, bar)
+                list(pool.map(lambda cv: job(cv[0], *cv[1]), zip(batch, vols)))
+
+        for k in range(len(slabs)):
+            each(k, cands, first_look(k))
+
+        # The choice between a pair's proposals rests on how well each fits every usable
+        # slab, so each proposal has to be scored in each of them. A slab has already
+        # scored the steps around its own shift and whatever earlier slabs proposed,
+        # which usually covers it: slabs mostly disagree by a step. Only what is still
+        # missing costs a second read.
+        missing = {}
+        for c in cands:
+            for o in c["obs"]:
+                if not o["reason"] and any(s not in o["at"] for s in c["proposed"]):
+                    missing.setdefault(o["slab"], []).append((c, o))
+        for k, items in sorted(missing.items()):
+            waiting = {id(c): o for c, o in items}
+            each(k, [c for c, _ in items], lambda c, va, vb: fill(c, waiting[id(c)], va, vb))
 
     spans = [[s[0], s[-1]] for s in slabs]
     edges, pairs = [], []
