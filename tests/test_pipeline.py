@@ -459,9 +459,12 @@ def test_usable_cpus_is_readable_here():
     assert 1 <= config.usable_cpus() <= (os.cpu_count() or 4)
 
 
-@pytest.mark.parametrize("name", ["n_read_threads", "n_write_workers", "prefetch",
-                                  "ilastik.threads"])
-@pytest.mark.parametrize("bad", [0, -2, 2.5, True, "8"])
+# One parametrize over the product, not two stacked: tools/minipytest.py runs these too,
+# and it takes a single parametrize per test.
+@pytest.mark.parametrize("name,bad", [(name, bad)
+                                      for name in ("n_read_threads", "n_write_workers",
+                                                   "prefetch", "ilastik.threads")
+                                      for bad in (0, -2, 2.5, True, "8")])
 def test_thread_settings_must_be_positive_ints_or_none(cfg, name, bad):
     owner, attr = (cfg.ilastik, "threads") if "." in name else (cfg, name)
     setattr(owner, attr, bad)
