@@ -10,6 +10,7 @@ from typing import List, Optional
 
 import numpy as np
 
+from . import config
 from .compute import Backend
 from .geometry import Tiler, overview_level
 from .plan import ScenePlan, plan_scenes
@@ -51,6 +52,20 @@ def default_progress():
     return _p
 
 
+# ---------------------------------------------------------------- threads
+def thread_summary(cfg):
+    """One line on the threads a run will use, naming any that were sized from the machine
+    rather than set, so a run that is slow or heavy can be traced to a number."""
+    line = (f"threads     {cfg.read_threads} read, {cfg.write_workers} write, "
+            f"{cfg.prefetch_tiles} tiles in flight")
+    auto = [name for name in ("n_read_threads", "n_write_workers", "prefetch")
+            if getattr(cfg, name) is None]
+    if auto:
+        line += (f"    ({', '.join(auto)} sized from this machine's {config.usable_cpus()} "
+                 "usable CPUs; set a number to choose)")
+    return line
+
+
 # ---------------------------------------------------------------- results
 @dataclass
 class Result:
@@ -90,9 +105,10 @@ class Pipeline:
         if mode == "refine" and cfg.refine.mode == "3d":
             mode += " (3d: XY and Z)"
         self.log(f"stitching   {mode}    compute  {self.backend.name}")
+        self.log(thread_summary(cfg))
         self.log("")
         self.log(self.source.describe())
-        peak = (cfg.prefetch * cfg.tile[0] * cfg.tile[1]
+        peak = (cfg.prefetch_tiles * cfg.tile[0] * cfg.tile[1]
                 * np.dtype(self.source.dtype).itemsize * self.source.samples)
         self.log(f"\nestimated pipeline RAM (tiles in flight): {peak / 1e6:.0f} MB"
                  + (f" + {cfg.mosaic_cache_mb} MB mosaic cache"

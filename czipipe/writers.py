@@ -157,7 +157,7 @@ def provenance(source, cfg, plan, out_path, elapsed, tiles):
                       "blend": cfg.blend if cfg.stitch_mode != "metadata" else None,
                       "log": plan.stitch_log},
         "runtime": {"seconds": round(elapsed, 1), "tiles": tiles,
-                    "read_threads": cfg.n_read_threads, "prefetch": cfg.prefetch},
+                    "read_threads": cfg.read_threads, "prefetch": cfg.prefetch_tiles},
         "versions": {"tifffile": tifffile.__version__, "numpy": np.__version__,
                      "python": sys.version.split()[0]},
     }
@@ -249,7 +249,7 @@ def write_tiff(source, cfg, backend, tiler, plan, log=print, progress=None):
                   compression=cfg.compression,
                   compressionargs=tiff_compressionargs(cfg.compression,
                                                        cfg.compression_level),
-                  maxworkers=cfg.n_write_workers)
+                  maxworkers=cfg.write_workers)
     stamp = json.dumps({"fingerprint": fp_hash, "config": fp_payload}, sort_keys=True)
     tags = [*extra_tags(source, cfg), (FINGERPRINT_TAG, "s", 0, stamp.encode("ascii"), True)]
 
@@ -261,13 +261,13 @@ def write_tiff(source, cfg, backend, tiler, plan, log=print, progress=None):
         # Written as <name>.partial and renamed on success, so the final name only ever
         # holds a finished file and a re-run can safely reuse it.
         with atomic_output(out_path) as tmp, \
-                ThreadPoolExecutor(cfg.n_read_threads) as ex, \
+                ThreadPoolExecutor(cfg.read_threads) as ex, \
                 progress(total=total, unit="tile", desc=plan.label) as bar, \
                 tifffile.TiffWriter(tmp, bigtiff=True, ome=True) as tif:
             tif.write(
                 data=stream(tiler.tasks(plan.rect, 0),
                             make_worker(source, cfg, backend, tiler, plan, 0),
-                            ex, cfg.prefetch, bar),
+                            ex, cfg.prefetch_tiles, bar),
                 shape=shape0, subifds=levels or None,
                 metadata=ome_metadata(source, cfg, plan),
                 extratags=tags, **common)
@@ -275,7 +275,7 @@ def write_tiff(source, cfg, backend, tiler, plan, log=print, progress=None):
                 tif.write(
                     data=stream(tiler.tasks(plan.rect, lvl),
                                 make_worker(source, cfg, backend, tiler, plan, lvl),
-                                ex, cfg.prefetch, bar),
+                                ex, cfg.prefetch_tiles, bar),
                     shape=tiler.level_shape(plan.rect, lvl),
                     subfiletype=1, metadata=None, **common)
         ok = True
@@ -528,7 +528,7 @@ def write_hdf5(source, cfg, backend, tiler, plan, log=print, progress=None):
     t0, ok, n_done = time.perf_counter(), False, done
     try:
         with h5py.File(out_path, "a" if resuming else "w") as f, \
-                ThreadPoolExecutor(cfg.n_read_threads) as ex, \
+                ThreadPoolExecutor(cfg.read_threads) as ex, \
                 progress(total=total, initial=done, unit="tile", desc=plan.label) as bar:
 
             if resuming:
@@ -563,12 +563,12 @@ def write_hdf5(source, cfg, backend, tiler, plan, log=print, progress=None):
             if pack is not None:
                 read, tail = work, (0,) * (len(shape) - 5)
                 work = lambda task: pack(read(task))      # compressed in the read thread
-                log(f"  gzip-{cfg.hdf5_level} compressed in the {cfg.n_read_threads} read "
+                log(f"  gzip-{cfg.hdf5_level} compressed in the {cfg.read_threads} read "
                     "threads (hdf5_parallel_compress)")
             dests = itertools.islice(tiler.tasks(plan.rect, 0), done, None)
             srcs = itertools.islice(tiler.tasks(plan.rect, 0), done, None)
 
-            for task, tile in zip(dests, stream(srcs, work, ex, cfg.prefetch, bar)):
+            for task, tile in zip(dests, stream(srcs, work, ex, cfg.prefetch_tiles, bar)):
                 _t, _z, _c, x, y, w, h = task
                 yi, xi = y - plan.rect[1], x - plan.rect[0]
                 if pack is not None:

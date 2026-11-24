@@ -96,6 +96,25 @@ seg = p.classify()
 p.preview_segmentation(seg)   # raw channels beside the labels at a few depths
 ```
 
+### Threads and memory
+
+Left at `None`, these are sized from the machine the run is on:
+
+| Setting | When left at `None` |
+|---|---|
+| `n_read_threads` | every usable CPU, at most 32 |
+| `n_write_workers` (TIFF compression) | every usable CPU, at most 32 |
+| `prefetch` (tiles in flight) | 3 per read thread |
+| `cfg.ilastik.threads` | every usable CPU |
+| `cfg.ilastik.ram_mb` | 75% of the installed RAM |
+
+Give any of them a number to choose it yourself. "Usable" means the logical CPUs the
+process is allowed to run on, which is fewer than the machine has inside a container or
+under a scheduler. `inspect()` prints the counts in use and which of them were chosen
+for you; `benchmark()` names the stage they are limiting. Peak conversion memory is
+still `prefetch × tile`, so it now grows with the CPU count: about 200 MB of 16-bit
+1024 px tiles at the 32-thread ceiling.
+
 ## Registration with `stitch_mode="refine"`
 
 `refine` corrects the stage positions by a single integer XY shift per tile. By default
@@ -228,8 +247,9 @@ Every stage can be interrupted and re-run; nothing that finished is redone.
   a 35-plane halo makes each 50-plane chunk classify 120 planes, so the log prints the
   cost at the current `chunk_z` and at larger ones. `chunk_z` can be changed between runs
   of a partial export; finished planes are kept.
-- **ilastik's RAM cap** (`cfg.ilastik.ram_mb`) defaults to half the installed RAM. Set a
-  number of MB to choose it yourself.
+- **ilastik's RAM cap** (`cfg.ilastik.ram_mb`) defaults to 75% of the installed RAM. Set a
+  number of MB to choose it yourself; ilastik treats the cap as approximate, so lower it
+  if the machine starts swapping or ilastik is killed for memory.
 - While ilastik runs, a line every 5 minutes reports elapsed time and the CPU used by its
   whole process tree, and warns when that stops rising (needs `psutil`).
 - **After a kernel restart**, run `inspect()`, `plan()` and `convert()` again before
@@ -262,7 +282,7 @@ Every stage can be interrupted and re-run; nothing that finished is redone.
 ## Tests
 
 ```bash
-python -m pytest                  # 286 tests
+python -m pytest                  # 311 tests
 python tools/minipytest.py        # if pytest is unavailable
 ```
 

@@ -14,6 +14,23 @@ from typing import Optional, Sequence, Union
 
 PathLike = Union[str, Path]
 
+ILASTIK_RAM_FRACTION = 0.75     # of the installed RAM, when ilastik.ram_mb is left at None
+MAX_AUTO_THREADS = 32           # ceiling on the thread counts chosen from the CPU count
+PREFETCH_PER_THREAD = 3         # tiles in flight per read thread, when prefetch is None
+
+
+def usable_cpus() -> int:
+    """Logical CPUs this process may run on; 4 if that cannot be read.
+
+    Fewer than the machine has when a container, a scheduler or `taskset` restricts the
+    process: threads beyond the CPUs it was given only take turns on them.
+    """
+    try:
+        n = len(os.sched_getaffinity(0))            # Linux; honours such restrictions
+    except (AttributeError, OSError):
+        n = os.cpu_count()
+    return int(n or 4)
+
 
 def physical_ram_mb() -> Optional[int]:
     """Installed RAM in MB, or None if it cannot be read on this machine."""
@@ -110,10 +127,12 @@ class IlastikConfig:
     exe: Optional[PathLike] = None                     # None -> autodetect
     export_source: str = "Simple Segmentation"         # or "Probabilities"
     export_dtype: str = "uint8"
-    ram_mb: Optional[int] = None       # LAZYFLOW_TOTAL_RAM_MB. None -> half the installed
-                                        # RAM: ilastik documents the cap as approximate and
-                                        # the OS still needs room to cache the input file.
-    threads: Optional[int] = None      # None -> os.cpu_count()
+    ram_mb: Optional[int] = None       # LAZYFLOW_TOTAL_RAM_MB. None -> 75% of the installed
+                                        # RAM. The rest is headroom: ilastik documents the
+                                        # cap as approximate, and the OS still needs room to
+                                        # cache the input file. Lower it if the machine
+                                        # swaps or ilastik is killed for memory.
+    threads: Optional[int] = None      # LAZYFLOW_THREADS. None -> every usable CPU
     timeout_h: float = 48.0
     seg_compression: Optional[str] = "zlib"
     keep_h5: bool = False
@@ -164,9 +183,14 @@ class Config:
     compression_level: int = 5
 
     # ---- performance ------------------------------------------------------
-    n_read_threads: int = 8
-    n_write_workers: int = 8
-    prefetch: int = 24                          # tiles in flight; peak RAM scales with this
+    # None sizes each of these from the machine the run is on; a number is used as given.
+    # What a run will use is in read_threads, write_workers and prefetch_tiles below, and
+    # in the first lines inspect() prints.
+    n_read_threads: Optional[int] = None        # None -> every usable CPU, at most 32
+    n_write_workers: Optional[int] = None       # TIFF compression threads; None -> same
+    prefetch: Optional[int] = None              # tiles in flight; peak RAM scales with this.
+                                                # None -> 3 per read thread. Fewer than the
+                                                # read threads leaves some of them idle.
     use_gpu: bool = True
 
     # ---- stitching --------------------------------------------------------
@@ -218,17 +242,44 @@ class Config:
         return self.out_stem or self.czi_path.stem
 
     @property
+    def read_threads(self) -> int:
+        """Threads reading (and, for HDF5, compressing) tiles: n_read_threads if set,
+        otherwise every usable CPU up to MAX_AUTO_THREADS."""
+        if self.n_read_threads is not None:
+            return int(self.n_read_threads)
+        return min(usable_cpus(), MAX_AUTO_THREADS)
+
+    @property
+    def write_workers(self) -> int:
+        """Threads compressing TIFF tiles: n_write_workers if set, otherwise every usable
+        CPU up to MAX_AUTO_THREADS. Reading and compressing are stages of one stream, so
+        whichever is the slower gets the CPUs; sizing both to the machine does not
+        halve either."""
+        if self.n_write_workers is not None:
+            return int(self.n_write_workers)
+        return min(usable_cpus(), MAX_AUTO_THREADS)
+
+    @property
+    def prefetch_tiles(self) -> int:
+        """Tiles in flight: prefetch if set, otherwise PREFETCH_PER_THREAD per read thread,
+        which keeps every read thread busy while the writer takes tiles in order."""
+        if self.prefetch is not None:
+            return int(self.prefetch)
+        return PREFETCH_PER_THREAD * self.read_threads
+
+    @property
     def ilastik_threads(self) -> int:
-        return int(self.ilastik.threads or os.cpu_count() or 4)
+        """LAZYFLOW_THREADS: ilastik.threads if set, otherwise every usable CPU."""
+        return int(self.ilastik.threads or usable_cpus())
 
     @property
     def ilastik_ram_mb(self) -> int:
-        """LAZYFLOW_TOTAL_RAM_MB: ilastik.ram_mb if set, otherwise half the installed RAM
-        (at least 2 GB), or 4 GB when the installed RAM cannot be read."""
+        """LAZYFLOW_TOTAL_RAM_MB: ilastik.ram_mb if set, otherwise ILASTIK_RAM_FRACTION of
+        the installed RAM (at least 2 GB), or 4 GB when the installed RAM cannot be read."""
         if self.ilastik.ram_mb:
             return int(self.ilastik.ram_mb)
         total = physical_ram_mb()
-        return max(2048, total // 2) if total else 4096
+        return max(2048, int(total * ILASTIK_RAM_FRACTION)) if total else 4096
 
     def validate(self) -> "Config":
         """Fail fast on settings that would otherwise blow up deep in a long run."""
@@ -279,6 +330,14 @@ class Config:
                              f"got {self.flatfield.smooth_mode!r}")
         if not 0 < self.flatfield.min_gain <= 1:
             raise ValueError("flatfield.min_gain must be in (0, 1]")
+        for name, v in (("n_read_threads", self.n_read_threads),
+                        ("n_write_workers", self.n_write_workers),
+                        ("prefetch", self.prefetch),
+                        ("ilastik.threads", self.ilastik.threads)):
+            if v is not None and (isinstance(v, bool) or not isinstance(v, Integral)
+                                  or v < 1):
+                raise ValueError(f"{name} must be a positive int, or None to size it from "
+                                 f"this machine's CPUs; got {v!r}")
         if self.ilastik.run and not 1 <= len(self.ilastik.projects) <= 3:
             raise ValueError("ilastik.projects must hold between 1 and 3 projects")
         if self.ilastik.ram_mb is not None and self.ilastik.ram_mb <= 0:

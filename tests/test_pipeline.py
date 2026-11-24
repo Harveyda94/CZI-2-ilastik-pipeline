@@ -420,3 +420,76 @@ def test_metadata_preview_shows_the_pixels_convert_will_write(cfg):
     assert img.dtype == np.uint16 and not np.array_equal(img, data[0, 1, 0])
     work = make_worker(src, cfg, Backend(False), tiler, plan, 0)
     assert np.array_equal(img[:64, :64], work((0, 1, 0, RECT[0], RECT[1], 64, 64)))
+
+
+# ---------------------------------------------------------------- sized from the machine
+def test_threads_and_workers_are_sized_from_the_machine_by_default(cfg, monkeypatch):
+    """Fixed counts of 8 left most of a workstation idle; left alone, each is now sized
+    from the CPUs the run has."""
+    from czipipe import config
+
+    auto = config.Config(czi_path=cfg.czi_path, out_dir=cfg.out_dir)
+    assert auto.n_read_threads is auto.n_write_workers is auto.prefetch is None
+    monkeypatch.setattr(config, "usable_cpus", lambda: 20)
+    assert (auto.read_threads, auto.write_workers, auto.ilastik_threads) == (20, 20, 20)
+    assert auto.prefetch_tiles == 60                     # three in flight per read thread
+    monkeypatch.setattr(config, "usable_cpus", lambda: 128)
+    assert (auto.read_threads, auto.write_workers, auto.prefetch_tiles) == (32, 32, 96)
+    assert auto.ilastik_threads == 128                   # ilastik's own pool is not capped
+    monkeypatch.setattr(config, "usable_cpus", lambda: 1)
+    assert (auto.read_threads, auto.write_workers, auto.prefetch_tiles) == (1, 1, 3)
+
+
+def test_thread_settings_given_as_numbers_are_used_as_given(cfg, monkeypatch):
+    from czipipe import config
+
+    monkeypatch.setattr(config, "usable_cpus", lambda: 20)
+    assert (cfg.read_threads, cfg.write_workers, cfg.prefetch_tiles) == (4, 2, 8)
+    cfg.prefetch = None
+    assert cfg.prefetch_tiles == 12                      # follows the read threads given
+    cfg.ilastik.threads = 6
+    assert cfg.ilastik_threads == 6
+
+
+def test_usable_cpus_is_readable_here():
+    import os
+
+    from czipipe import config
+
+    assert 1 <= config.usable_cpus() <= (os.cpu_count() or 4)
+
+
+@pytest.mark.parametrize("name", ["n_read_threads", "n_write_workers", "prefetch",
+                                  "ilastik.threads"])
+@pytest.mark.parametrize("bad", [0, -2, 2.5, True, "8"])
+def test_thread_settings_must_be_positive_ints_or_none(cfg, name, bad):
+    owner, attr = (cfg.ilastik, "threads") if "." in name else (cfg, name)
+    setattr(owner, attr, bad)
+    with pytest.raises(ValueError, match=name.replace(".", r"\.")):
+        cfg.validate()
+    setattr(owner, attr, None)
+    cfg.validate()
+
+
+def test_inspect_says_which_thread_counts_came_from_the_machine(cfg, monkeypatch):
+    from czipipe import config
+    from czipipe.pipeline import thread_summary
+
+    monkeypatch.setattr(config, "usable_cpus", lambda: 20)
+    line = thread_summary(cfg)                           # the fixture sets all three
+    assert "4 read, 2 write, 8 tiles in flight" in line and "sized from" not in line
+    cfg.n_read_threads = cfg.prefetch = None
+    line = thread_summary(cfg)
+    assert "20 read, 2 write, 60 tiles in flight" in line
+    assert "n_read_threads, prefetch sized from this machine's 20 usable CPUs" in line
+
+
+def test_conversion_runs_with_thread_settings_left_to_the_machine(cfg):
+    """Nothing downstream may read the raw settings: left at None they are not numbers."""
+    cfg.n_read_threads = cfg.n_write_workers = cfg.prefetch = None
+    src, tiler, plan, data = build(cfg)
+    path = write_tiff(src, cfg, Backend(False), tiler, plan,
+                      log=lambda *a: None, progress=_null_progress)
+    with tifffile.TiffFile(path) as tf:
+        back = np.stack([p.asarray() for p in tf.pages]).reshape(data.shape)
+    assert np.array_equal(back, data)

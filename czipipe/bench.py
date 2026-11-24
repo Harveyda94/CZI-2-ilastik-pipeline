@@ -61,12 +61,15 @@ def benchmark(pipe, n=8):
     slowest = max(stages, key=lambda kv: kv[1])[0]
     pipe.log(f"\n  bottleneck: {slowest}")
     pipe.log({
-        "read": "  -> raise n_read_threads until it stops helping; then you are disk-bound "
-                "and only faster storage helps. Copying the CZI off a network share to "
-                "local NVMe is often the single largest win.",
+        "read": f"  -> {cfg.read_threads} read threads are in use (n_read_threads; every "
+                "usable CPU unless set). If more does not help you are disk-bound and "
+                "only faster storage does. Copying the CZI off a network share to local "
+                "NVMe is often the single largest win.",
         "composite": "  -> refine/bigstitcher decode whole mosaic tiles. Raise "
                      "mosaic_cache_mb if tiles are being evicted and re-read.",
         "convert": "  -> the only case where use_gpu matters. It rarely is.",
-        "compress": "  -> raise n_write_workers, lower compression_level, or switch to zstd.",
+        "compress": f"  -> {cfg.write_workers} compression workers are in use "
+                    "(n_write_workers; every usable CPU unless set). Lower "
+                    "compression_level, or switch to zstd.",
     }[slowest])
     return {"stages": dict(stages), "mb": mb, "ratio": ratio, "bottleneck": slowest}

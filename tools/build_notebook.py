@@ -138,9 +138,10 @@ cfg = Config(
     compression_level = 5,
 
     # ---- performance -------------------------------------------------------
-    n_read_threads  = 8,
-    n_write_workers = 8,
-    prefetch        = 24,          # peak RAM scales with this
+    n_read_threads  = None,        # None = every usable CPU (at most 32); or a number
+    n_write_workers = None,        # None = the same; TIFF compression threads
+    prefetch        = None,        # tiles in flight, peak RAM scales with this;
+                                   # None = 3 per read thread
     use_gpu         = True,
 
     # ---- stitching ---------------------------------------------------------
@@ -193,7 +194,8 @@ cfg.ilastik.exe           = None   # None = autodetect; else run_ilastik.sh / il
                                    # e.g. r"C:\Program Files\ilastik-1.4.1\ilastik.exe"
 cfg.ilastik.projects      = []     # e.g. ["/path/to/project_a.ilp", ("tag_b", "/path/to/project_b.ilp")]
 cfg.ilastik.export_source = "Simple Segmentation"   # "Probabilities" is ~50x larger
-cfg.ilastik.ram_mb        = None   # None = half the installed RAM; or a number of MB
+cfg.ilastik.ram_mb        = None   # None = 75% of the installed RAM; or a number of MB
+cfg.ilastik.threads       = None   # None = every usable CPU; or a number
 cfg.ilastik.dry_run       = True   # print the command first; verify before a long run
 cfg.ilastik.chunk_z       = None   # e.g. 150: classify 150 Z-planes per ilastik run, so an
                                    # interruption loses one chunk, not the whole run. Each

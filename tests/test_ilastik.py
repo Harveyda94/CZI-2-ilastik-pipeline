@@ -299,15 +299,17 @@ def test_nonzero_exit_is_reported(cfg, tmp_path):
         ilastik.run_command(cfg, cmd, tmp_path / "ilastik.log", log=lambda *a: None)
 
 
-def test_ram_cap_defaults_to_half_the_installed_ram(cfg, monkeypatch):
+def test_ram_cap_defaults_to_three_quarters_of_the_installed_ram(cfg, monkeypatch):
     """A fixed 4 GB default starved ilastik on a workstation; it is sized from the machine
     unless a number is given."""
     from czipipe import config
 
     monkeypatch.setattr(config, "physical_ram_mb", lambda: 65536)
     assert cfg.ilastik.ram_mb is None
-    assert cfg.ilastik_ram_mb == 32768
-    monkeypatch.setattr(config, "physical_ram_mb", lambda: 3000)
+    assert cfg.ilastik_ram_mb == 49152
+    monkeypatch.setattr(config, "physical_ram_mb", lambda: 16384)
+    assert cfg.ilastik_ram_mb == 12288
+    monkeypatch.setattr(config, "physical_ram_mb", lambda: 2400)
     assert cfg.ilastik_ram_mb == 2048                    # floor on a small machine
     monkeypatch.setattr(config, "physical_ram_mb", lambda: None)
     assert cfg.ilastik_ram_mb == 4096                    # cannot tell: the old default
@@ -332,8 +334,8 @@ def test_ram_cap_reaches_ilastik_and_the_log_says_where_it_came_from(cfg, tmp_pa
     """)
     msgs = []
     assert ilastik.run_command(cfg, cmd, tmp_path / "ilastik.log", log=msgs.append) is True
-    assert any("Exporting with 32768" in m for m in msgs)
-    assert any("half of the 64 GB installed" in m for m in msgs)
+    assert any("Exporting with 49152" in m for m in msgs)
+    assert any("75% of the 64 GB installed" in m for m in msgs)
 
     cfg.ilastik.ram_mb = 8192
     msgs.clear()

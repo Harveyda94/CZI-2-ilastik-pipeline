@@ -287,7 +287,8 @@ def run_command(cfg, cmd, log_path, log=print, heartbeat_s=300):
     if not cfg.ilastik.ram_mb:
         total = config.physical_ram_mb()
         log("  RAM cap chosen automatically: "
-            + (f"half of the {total / 1024:.0f} GB installed" if total else
+            + (f"{config.ILASTIK_RAM_FRACTION:.0%} of the {total / 1024:.0f} GB installed"
+               if total else
                "the installed RAM could not be read, so the 4 GB default")
             + ". Set ilastik.ram_mb to choose it yourself.")
     log("  " + " \\\n    ".join(cmd))
@@ -518,7 +519,7 @@ def seg_to_tiff(source, cfg, tiler, h5_path, out_tiff, class_names, progress=Non
             tif.write(data=gen(bar), shape=(nt, nz, nc, H, W), dtype=d.dtype,
                       tile=tuple(cfg.tile), photometric="minisblack",
                       compression=cfg.ilastik.seg_compression, compressionargs=cargs,
-                      maxworkers=cfg.n_write_workers, metadata=meta,
+                      maxworkers=cfg.write_workers, metadata=meta,
                       extratags=extra_tags(source, cfg))
     return out_tiff
 
