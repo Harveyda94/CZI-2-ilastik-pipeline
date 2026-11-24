@@ -624,15 +624,19 @@ def seg_to_tiff(source, cfg, tiler, h5_path, out_tiff, class_names, progress=Non
 
 
 # ---------------------------------------------------------------- chunked export
-def _classifier_export_shape(cfg, tiler, plan):
+def _classifier_export_shape(cfg, tiler, plan, n_classes=0):
     """Expected (T,Z,C,Y,X) of ilastik's own export h5, given export_source.
 
     Simple Segmentation always collapses to a single label channel regardless of how
-    many channels the raw input had; Probabilities keeps one channel per class.
+    many channels the raw input had; Probabilities has one channel per class, which has
+    nothing to do with the number of input channels. `n_classes` is the project's class
+    count; where it is unknown (0) the input's channel count is all there is to go on.
     """
     shape = list(tiler.level_shape(plan.rect, 0))
     if cfg.ilastik.export_source != "Probabilities":
         shape[2] = 1
+    elif n_classes:
+        shape[2] = int(n_classes)
     return tuple(shape)
 
 
@@ -652,16 +656,20 @@ def _chunk_fingerprint(cfg, ilp, raw_h5, axes, export_shape, halo_z):
 
 
 def _chunk_resume_state(h5py, out_h5, want_hash, want_payload):
-    """('new'|'resume'|'complete'|'mismatch'|'unreadable', z_done, detail)."""
+    """('new'|'resume'|'complete'|'mismatch'|'foreign'|'unreadable', z_done, detail).
+
+    'foreign' is an export with no chunk record: one that a run without chunk_z made,
+    or is part-way through making.
+    """
     if not out_h5.is_file():
         return "new", 0, None
     try:
         with h5py.File(out_h5, "r") as f:
-            if "progress" not in f and _export_dataset(f) is None:
-                # Nothing to continue and nothing to lose, e.g. the file an earlier
-                # version marked complete after a run that had exported nothing, or
-                # only a group where the image should be.
-                return "new", 0, None
+            if "progress" not in f:
+                # With no export either there is nothing to continue and nothing to
+                # lose, e.g. the file an earlier version marked complete after a run
+                # that had exported nothing, or only a group where the image should be.
+                return ("new" if _export_dataset(f) is None else "foreign"), 0, None
             prog = f["progress"]
             got = prog.attrs["fingerprint"]
             got = got.decode() if isinstance(got, bytes) else got
@@ -685,6 +693,41 @@ def _chunk_resume_state(h5py, out_h5, want_hash, want_payload):
                  for k in sorted(keys) if old.get(k) != want_payload.get(k)]
         return "mismatch", z_done, diffs or ["(the stored fingerprint predates this version)"]
     return ("complete" if complete else "resume"), z_done, None
+
+
+# What to do about an ilastik export that is in the way. Not "set overwrite=True": that
+# setting is the whole run's, and would rebuild the conversion the export was made from.
+_OVERWRITE_IS_WIDER = ("(overwrite=True would remove it too, but it applies to the "
+                       "conversion as well and would rebuild that first.)")
+
+
+def _chunked_export_state(cfg, ilp, raw_h5, out_h5, axes, export_shape, halo_z):
+    """_chunk_resume_state for this job if `out_h5` carries a chunk record, else None."""
+    import h5py
+
+    out_h5 = Path(out_h5)
+    if not out_h5.is_file():
+        return None
+    try:
+        with h5py.File(out_h5, "r") as f:
+            if "progress" not in f:
+                return None
+    except Exception:
+        return None
+    want_hash, want_payload = _chunk_fingerprint(cfg, ilp, raw_h5, axes, export_shape, halo_z)
+    return _chunk_resume_state(h5py, out_h5, want_hash, want_payload)
+
+
+def _chunked_export_in_the_way(out_h5, state, z_done, detail, Z):
+    """Why a run without chunk_z will not go ahead over a chunked export with planes in it."""
+    what = f"{out_h5.name} holds a chunked export with {z_done} of {Z} Z-planes done"
+    if state == "mismatch":
+        return (what + ", started with different settings:\n  - " + "\n  - ".join(detail)
+                + "\nA run without chunk_z would discard it. Delete it to classify again, "
+                "or restore those settings and set ilastik.chunk_z to continue it.")
+    return (what + ". A run without chunk_z cannot continue it and would discard it: set "
+            "ilastik.chunk_z to carry on from there, or delete the file to classify in "
+            "one run.")
 
 
 def planes_computed(z_from, Z, n, halo):
@@ -743,14 +786,27 @@ def run_classify_chunked(cfg, exe, ilp, raw_h5, internal, out_h5, axes, export_s
     want_hash, want_payload = _chunk_fingerprint(cfg, ilp, raw_h5, axes, export_shape, halo_z)
 
     state, z_done, detail = _chunk_resume_state(h5py, out_h5, want_hash, want_payload)
+    if state == "mismatch" and not z_done:
+        # Refusing protects exported planes, and there are none. Without this, a first
+        # chunk that failed leaves a file that every later, corrected run trips over.
+        log(f"[{out_h5.name}] was started with different settings, but nothing had been "
+            "exported into it; starting it again")
+        state = "new"
     if state == "mismatch":
         raise RuntimeError(
             f"{out_h5.name} exists but was started with different settings, so it cannot "
             "be continued:\n  - " + "\n  - ".join(detail) +
-            "\nSet overwrite=True to rebuild it, or restore the settings it was started with.")
+            "\nRestore the settings it was started with to continue it, or delete it to "
+            f"classify again from the first plane. {_OVERWRITE_IS_WIDER}")
+    if state == "foreign":
+        raise RuntimeError(
+            f"{out_h5.name} holds an ilastik export but no chunked progress record, so it "
+            "was not made with chunk_z and cannot be continued in chunks. It is not marked "
+            "as a finished export of this project and input either, so it is not used as "
+            f"one. Delete or move it to classify again. {_OVERWRITE_IS_WIDER}")
     if state == "unreadable":
         raise RuntimeError(f"{out_h5.name} exists but its progress record could not be read "
-                           f"({detail}). Set overwrite=True to rebuild.")
+                           f"({detail}). Delete it to classify again. {_OVERWRITE_IS_WIDER}")
     if state == "complete":
         log(f"[{out_h5.name}] already complete ({Z} Z-planes, {n_chunks} chunks); "
             "skipping ilastik entirely")
@@ -884,19 +940,42 @@ def classify(source, cfg, tiler, results, log=print, progress=None):
                     continue
                 log(f"\n[{tag}] {plan.label}")
                 key = _job_key(cfg, ilp, raw_h5, internal)
-                if cfg.ilastik.chunk_z:
+                export_shape = _classifier_export_shape(cfg, tiler, plan,
+                                                        len(info["classes"]))
+                halo_z = feature_halo(info["max_sigma"])
+                # A finished export is the same thing whether one run made it or a run
+                # per chunk, so chunk_z decides how to classify, not what may be reused:
+                # switching it between runs must never cost an export already made.
+                in_one_run = not cfg.overwrite and _export_is_complete(out_h5, key)
+                in_chunks = (None if cfg.overwrite or in_one_run or cfg.ilastik.chunk_z else
+                             _chunked_export_state(cfg, ilp, raw_h5, out_h5, source.h5_axes,
+                                                   export_shape, halo_z))
+                if in_one_run:
+                    log(f"  reusing {out_h5.name}: ilastik finished it on an earlier run"
+                        + (" made without chunk_z" if cfg.ilastik.chunk_z else ""))
+                elif in_chunks and in_chunks[0] == "complete":
+                    log(f"  reusing {out_h5.name}: ilastik finished it in chunks on an "
+                        "earlier run")
+                elif cfg.ilastik.chunk_z:
                     # Resumes from its own per-chunk record inside out_h5, so a partial
                     # export is continued here rather than removed.
                     if cfg.overwrite and not cfg.ilastik.dry_run:
                         out_h5.unlink(missing_ok=True)
+                    if cfg.ilastik.export_source == "Probabilities" and not info["classes"]:
+                        log("  [warn] the project's class names could not be read, so the "
+                            "export is taken to have one channel per input channel "
+                            f"({export_shape[2]}). If the project has a different number "
+                            "of classes the first chunk will say so and stop.")
                     if not run_classify_chunked(
                             cfg, exe, ilp, raw_h5, internal, out_h5, source.h5_axes,
-                            _classifier_export_shape(cfg, tiler, plan),
-                            halo_z=feature_halo(info["max_sigma"]), log=log):
+                            export_shape, halo_z=halo_z, log=log):
                         continue
-                elif not cfg.overwrite and _export_is_complete(out_h5, key):
-                    log(f"  reusing {out_h5.name}: ilastik finished it on an earlier run")
                 else:
+                    if in_chunks and in_chunks[1]:
+                        # Planes already exported in chunks, hours of work each. A run
+                        # in one piece cannot continue them, and used to delete them.
+                        raise RuntimeError(_chunked_export_in_the_way(
+                            out_h5, *in_chunks, export_shape[1]))
                     cmd = build_command(cfg, exe, ilp, raw_h5, internal, out_h5,
                                         source.h5_axes)
                     if out_h5.exists() and not cfg.ilastik.dry_run:

@@ -340,9 +340,10 @@ resumes per scene and project: finished segmentations are skipped, an ilastik ex
 completed before its TIFF conversion was interrupted is reused, and an interrupted ilastik
 run starts again (ilastik itself cannot resume). With `cfg.ilastik.chunk_z` set, it
 continues from the last finished Z-chunk instead, and prints what the Z halo costs at that
-chunk size; `chunk_z` can be changed between runs without losing finished planes. After a
-kernel restart, run Inspect, Plan and Convert first (Convert skips finished outputs), then
-this cell.
+chunk size; `chunk_z` can be changed between runs without losing finished planes, and
+switching it on or off never discards an export (a partial chunked export stops a run
+without `chunk_z` rather than being removed). After a kernel restart, run Inspect, Plan and
+Convert first (Convert skips finished outputs), then this cell.
 """)
 
 code(r'''

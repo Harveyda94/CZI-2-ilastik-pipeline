@@ -388,6 +388,30 @@ def test_fingerprint_marks_only_a_flatfield_applied_per_mosaic_tile(cfg):
     assert "flatfield_applied" not in writers._settings_payload(src, cfg, single, shape)
 
 
+def test_metadata_mosaic_from_before_the_fix_is_not_told_to_switch_the_flatfield_off(cfg):
+    """That advice holds where the stitching mode composites through czipipe anyway. In
+    "metadata" mode it does so only for a flat-field: with the flat-field off libCZI
+    blends the mosaic, and differently, so the file matched no setting at all while its
+    error went on recommending one."""
+    from czipipe import writers
+
+    src, tiler, plan = _mosaic_job(cfg, corrected=True)
+    cfg.stitch_mode = "metadata"
+    shape = tiler.level_shape(plan.rect, 0)
+    old = writers._settings_payload(src, cfg, plan, shape)
+    del old["flatfield_applied"]                      # as the earlier version recorded it
+
+    cfg.flatfield.mode = "none"                       # the advice, followed
+    new = writers._settings_payload(src, cfg, ScenePlan(None, plan.rect, {}), shape)
+    assert not writers._same_but_uncorrected(old, new)
+    note = writers._describe_diffs(old, new)[-1]
+    assert "uncorrected" in note and "can only be rebuilt" in note
+    assert "flatfield.mode" not in note
+
+    old["stitch_mode"] = "refine"                     # composited either way: it stands
+    assert 'flatfield.mode = "none"' in writers._describe_diffs(old, new)[-1]
+
+
 def _written_before_the_fix(cfg, monkeypatch, fmt):
     """An output as the earlier version left it: flat-field recorded, pixels uncorrected."""
     import sys

@@ -285,6 +285,13 @@ Every stage can be interrupted and re-run; nothing that finished is redone.
   a 35-plane halo makes each 50-plane chunk classify 120 planes, so the log prints the
   cost at the current `chunk_z` and at larger ones. `chunk_z` can be changed between runs
   of a partial export; finished planes are kept.
+- **Switching `chunk_z` on or off between runs never costs an export.** A finished export
+  is used whichever way it was made. A partial chunked one cannot be continued by a run
+  in one piece, so with `chunk_z` off that run stops and says how many planes are done,
+  instead of removing them. When an export is in the way, the message says to delete that
+  file: `overwrite = True` would also rebuild the conversion it was made from.
+- **`"Probabilities"` in chunks** has one channel per class, read from the project. (It
+  was sized from the input's channels, so it only worked when the two counts matched.)
 - **ilastik's RAM cap** (`cfg.ilastik.ram_mb`) defaults to 75% of the installed RAM. Set a
   number of MB to choose it yourself; ilastik treats the cap as approximate, so lower it
   if the machine starts swapping or ilastik is killed for memory.
@@ -428,7 +435,10 @@ Found by review rather than in the field:
   `flatfield.mode = "none"` to keep using that file as the uncorrected output it is (it
   is not modified, so a chunked classification already under way on it continues), or
   `overwrite = True` to rebuild it corrected. A classifier trained on the uncorrected
-  pixels should be checked against the corrected ones.
+  pixels should be checked against the corrected ones. The exception is such a mosaic
+  converted with `stitch_mode = "metadata"`: it was blended by czipipe only because a
+  flat-field was set, so with the flat-field off no setting describes it, and it has to
+  be rebuilt.
 - **Sidecar names lost everything after the first dot in the file name**, so
   `brain_0.5x_scene00` wrote `brain_0.conversion.json` and every scene overwrote it.
 - **Chunked classification staged only timepoint 0**, so later timepoints were classified

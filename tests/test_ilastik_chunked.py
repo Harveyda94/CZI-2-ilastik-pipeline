@@ -78,6 +78,8 @@ class FakeIlastik:
         h5_path, internal = cmd[-1].rsplit(".h5/", 1)
         with h5py.File(h5_path + ".h5", "r") as f:
             result = classifier(f[internal][()])
+        if "--export_source=Probabilities" in cmd:      # one channel per class
+            result = np.concatenate([result == 1, result == 2], axis=2).astype(np.uint8)
         if self.calls == self.bad_shape_on:
             result = result[:, :-1]          # ilastik logged an error but still exited 0
         _, name = ilastik_export_target(cmd)
@@ -233,6 +235,22 @@ def test_partial_export_from_a_different_project_is_refused(run):
     assert "ilp_bytes" in str(e.value)
 
 
+def test_export_with_nothing_in_it_is_started_again_when_the_settings_change(run):
+    """Refusing protects exported planes. A first chunk that failed leaves none, and its
+    file used to stop every later run until overwrite=True, which rebuilds the
+    conversion as well."""
+    run.fake.fail_on = (1, KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        run()
+    run.ilp.write_bytes(b"project, retrained")
+    run.fake.fail_on, run.fake.calls = None, 0
+    assert run() is True
+    assert run.fake.calls == 5
+    assert any("nothing had been exported" in m for m in run.logs)
+    data, prog = exported(run.out)
+    assert np.array_equal(data, classifier(run.vol)) and prog["complete"]
+
+
 def test_export_with_the_wrong_shape_fails_that_chunk_and_is_retried(run):
     run.fake.bad_shape_on = 2
     with pytest.raises(RuntimeError, match=r"chunk 2/5 \(Z=5:10\)"):
@@ -307,9 +325,11 @@ def test_file_holding_no_export_at_all_is_started_afresh(run):
 def test_export_without_a_progress_record_is_not_overwritten(run):
     with h5py.File(run.out, "w") as f:
         f.create_dataset("exported_data", data=np.ones((1, 2, 1, 4, 4), np.uint8))
-    with pytest.raises(RuntimeError, match="progress record"):
+    with pytest.raises(RuntimeError, match="progress record") as e:
         run()
     assert run.fake.calls == 0
+    # Not "set overwrite=True": that is the whole run's setting, conversion included.
+    assert "Delete or move it" in str(e.value)
 
 
 def test_dry_run_stops_after_printing_the_first_chunk(run):
@@ -363,6 +383,118 @@ def test_classify_with_chunk_z_produces_a_labelled_segmentation(cfg, job):
     assert np.array_equal(back, classifier(data).reshape(back.shape))
     assert "Label values: 1=background, 2=vessel" in ome
     assert not (cfg.out_dir / "fake_seg.h5").exists()    # keep_h5=False tidies up
+
+
+def classify(cfg, job, log=None):
+    src, tiler, plan, tif, data, fake = job
+    return ilastik.classify(src, cfg, tiler, [(plan, tif)], log=log or (lambda *a: None),
+                            progress=_null_progress)
+
+
+def pages(path):
+    with tifffile.TiffFile(path) as tf:
+        return np.stack([p.asarray() for p in tf.pages])
+
+
+def segmentation_is_right(path, data):
+    back = pages(path)
+    return np.array_equal(back, classifier(data).reshape(back.shape))
+
+
+def _interrupted(*a, **k):
+    raise KeyboardInterrupt
+
+
+def test_probabilities_in_chunks_have_one_channel_per_class(cfg, job):
+    """The chunked export was sized from the input's channels. One input channel and two
+    classes, and every chunk failed its shape check."""
+    src, tiler, plan, tif, data, fake = job
+    cfg.ilastik.export_source = "Probabilities"
+    (scene, tag, path), = classify(cfg, job)
+    assert fake.calls == 3
+    labels = classifier(data)[0, :, 0]                              # (Z, Y, X)
+    back = pages(path).reshape((len(SEL_Z), 2) + labels.shape[1:])
+    assert np.array_equal(back[:, 0], labels == 1)
+    assert np.array_equal(back[:, 1], labels == 2)
+
+
+def test_export_shape_follows_the_export_source(cfg, job):
+    src, tiler, plan, *_ = job
+    assert ilastik._classifier_export_shape(cfg, tiler, plan, 3)[2] == 1
+    cfg.ilastik.export_source = "Probabilities"
+    assert ilastik._classifier_export_shape(cfg, tiler, plan, 3)[2] == 3
+    assert ilastik._classifier_export_shape(cfg, tiler, plan)[2] == len(SEL_C)   # unknown
+
+
+# ---------------------------------------------------------------- chunk_z switched between runs
+def test_export_finished_without_chunk_z_is_used_once_chunk_z_is_set(cfg, job, monkeypatch):
+    """It stopped on "progress record could not be read ... Set overwrite=True", which
+    would have thrown away the finished export and the conversion under it."""
+    src, tiler, plan, tif, data, fake = job
+    cfg.ilastik.chunk_z = None
+    real = ilastik.seg_to_tiff
+    monkeypatch.setattr(ilastik, "seg_to_tiff", _interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        classify(cfg, job)
+    assert fake.calls == 1
+
+    monkeypatch.setattr(ilastik, "seg_to_tiff", real)
+    cfg.ilastik.chunk_z = 3
+    (scene, tag, path), = classify(cfg, job)
+    assert fake.calls == 1                                # ilastik was not run again
+    assert segmentation_is_right(path, data)
+
+
+def test_export_finished_in_chunks_is_used_once_chunk_z_is_switched_off(cfg, job, monkeypatch):
+    src, tiler, plan, tif, data, fake = job
+    real = ilastik.seg_to_tiff
+    monkeypatch.setattr(ilastik, "seg_to_tiff", _interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        classify(cfg, job)
+    assert fake.calls == 3
+
+    monkeypatch.setattr(ilastik, "seg_to_tiff", real)
+    cfg.ilastik.chunk_z = None
+    msgs = []
+    (scene, tag, path), = classify(cfg, job, log=msgs.append)
+    assert fake.calls == 3
+    assert any("finished it in chunks" in m for m in msgs)
+    assert segmentation_is_right(path, data)
+
+
+def test_partial_chunked_export_survives_chunk_z_being_switched_off(cfg, job):
+    """A run in one piece cannot continue it, and removed it as "left by an interrupted
+    run": every finished chunk gone for one changed setting."""
+    src, tiler, plan, tif, data, fake = job
+    fake.fail_on = (2, KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        classify(cfg, job)
+
+    fake.fail_on, fake.calls = None, 0
+    cfg.ilastik.chunk_z = None
+    with pytest.raises(RuntimeError, match="3 of 7 Z-planes done") as e:
+        classify(cfg, job)
+    assert "set ilastik.chunk_z" in str(e.value) and fake.calls == 0
+    _, prog = exported(cfg.out_dir / "fake_seg.h5")
+    assert prog["z_done"] == 3
+
+    cfg.ilastik.chunk_z = 3
+    (scene, tag, path), = classify(cfg, job)
+    assert fake.calls == 2                                # only the chunks that were left
+    assert segmentation_is_right(path, data)
+
+
+def test_chunked_export_with_nothing_in_it_does_not_block_a_run_in_one_piece(cfg, job):
+    src, tiler, plan, tif, data, fake = job
+    fake.fail_on = (1, KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt):
+        classify(cfg, job)
+
+    fake.fail_on, fake.calls = None, 0
+    cfg.ilastik.chunk_z = None
+    (scene, tag, path), = classify(cfg, job)
+    assert fake.calls == 1
+    assert segmentation_is_right(path, data)
 
 
 def test_preview_shows_raw_and_labels_at_spread_depths(cfg, job):

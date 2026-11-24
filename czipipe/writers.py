@@ -442,7 +442,16 @@ def _describe_diffs(old, new):
     keys = set(old) | set(new)
     diffs = [f"{k}: was {old.get(k)!r}, now {new.get(k)!r}"
              for k in sorted(keys) if old.get(k) != new.get(k)]
-    if _unapplied_flatfield(old):
+    if _unapplied_flatfield(old) and old.get("stitch_mode") == "metadata":
+        # Turning the flat-field off does not describe this file either. In "metadata"
+        # mode a mosaic goes through this package's compositor only when there is a
+        # flat-field to apply; without one libCZI blends it, and blends it differently.
+        diffs.append(f"note: {UNAPPLIED_NOTE}. It was blended by czipipe, which "
+                     'stitch_mode = "metadata" does only when a flat-field is set: with '
+                     "one set the pixels are now corrected, and with none libCZI blends "
+                     "them instead. No setting of this version matches the file, so it "
+                     "can only be rebuilt")
+    elif _unapplied_flatfield(old):
         diffs.append(f"note: {UNAPPLIED_NOTE}. Set flatfield.mode = \"none\" to keep "
                      "using it as it is, or overwrite=True to rebuild it corrected")
     return diffs or ["(the stored fingerprint predates this version)"]
