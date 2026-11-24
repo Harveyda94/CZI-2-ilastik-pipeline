@@ -276,6 +276,28 @@ def snapshot_of(path):
     return FakeH5.STORE[str(path)]
 
 
+# ---------------------------------------------------------------- ilastik's export path
+def ilastik_export_target(cmd):
+    """(group, dataset name) that ilastik on Windows writes its HDF5 export to.
+
+    Follows lazyflow 1.4.2. OpExportSlot joins the file name and --output_internal_path
+    with a slash, PathComponents keeps what comes after the extension, and
+    OpH5N5WriterBigDataset divides that with os.path.split: the group is created if it
+    is missing, and the dataset is created in it under the name. On Windows that is
+    ntpath.split, for which (since Python 3.11) a path opening with two slashes names a
+    network share, and one with nothing after the share is all drive and no file name.
+    The rule is written out here so the answer does not depend on the Python running
+    the tests.
+    """
+    arg = next((a.split("=", 1)[1] for a in cmd
+                if a.startswith("--output_internal_path=")), "exported_data")
+    internal = "/" + arg
+    if internal.startswith("//") and "/" not in internal[2:]:
+        return internal, ""
+    group, _, name = internal.rpartition("/")
+    return group or "/", name
+
+
 # ---------------------------------------------------------------- fixtures
 @pytest.fixture
 def cfg(tmp_path):

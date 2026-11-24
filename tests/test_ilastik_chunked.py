@@ -24,7 +24,7 @@ from czipipe.pipeline import _null_progress
 from czipipe.plan import ScenePlan
 from czipipe.writers import vigra_axistags, write_tiff
 
-from conftest import FakeSource
+from conftest import FakeSource, ilastik_export_target
 
 try:
     import h5py
@@ -60,6 +60,7 @@ class FakeIlastik:
         self.fail_on = None          # (call number, exception) to raise instead of running
         self.bad_shape_on = None     # call number that "succeeds" with a malformed export
         self.no_output_on = None     # call number that "succeeds" having written nothing
+        self.group_on = None         # call number that "succeeds" leaving an empty group
         self.dry = False             # behave like cfg.ilastik.dry_run: print, don't run
 
     def __call__(self, cfg, cmd, log_path, log=print):
@@ -79,8 +80,12 @@ class FakeIlastik:
             result = classifier(f[internal][()])
         if self.calls == self.bad_shape_on:
             result = result[:, :-1]          # ilastik logged an error but still exited 0
+        _, name = ilastik_export_target(cmd)
         with h5py.File(out, "w") as f:
-            f.create_dataset("exported_data", data=result)
+            if name and self.calls != self.group_on:
+                f.create_dataset(name, data=result)
+            else:           # ilastik makes the group, then has no name for the dataset
+                f.create_group("exported_data")
         return True
 
 
@@ -257,6 +262,36 @@ def test_chunk_that_exports_nothing_names_the_file_and_quotes_ilastiks_error(run
     assert run.fake.calls == 4
     data, _ = exported(run.out)
     assert np.array_equal(data, classifier(run.vol))
+
+
+def test_chunk_whose_export_is_a_group_says_so_and_is_retried(run):
+    """ilastik 1.4.2 on Windows made a group called exported_data and wrote no image
+    (see test_export_path_names_a_dataset_to_ilastik_on_windows). Reading its shape was
+    reported as "'Group' object has no attribute 'shape'"."""
+    run.fake.group_on = 2
+    with pytest.raises(RuntimeError, match=r"chunk 2/5 \(Z=5:10\)") as e:
+        run()
+    msg = str(e.value)
+    assert "'exported_data' in seg.chunk_out.h5 is a group with no image in it" in msg
+    assert "has no attribute" not in msg
+    _, prog = exported(run.out)
+    assert prog["z_done"] == 5 and not prog["complete"]
+
+    run.fake.group_on, run.fake.calls = None, 0
+    assert run() is True
+    assert run.fake.calls == 4
+    data, _ = exported(run.out)
+    assert np.array_equal(data, classifier(run.vol))
+
+
+def test_file_holding_only_an_export_group_is_started_afresh(run):
+    """Left by a non-chunked run under that ilastik, and marked complete all the same."""
+    with h5py.File(run.out, "w") as f:
+        f.create_group("exported_data")
+        f.attrs[ilastik.EXPORT_DONE_ATTR] = "a job that exported a group"
+    assert run() is True
+    data, prog = exported(run.out)
+    assert np.array_equal(data, classifier(run.vol)) and prog["complete"]
 
 
 def test_file_holding_no_export_at_all_is_started_afresh(run):

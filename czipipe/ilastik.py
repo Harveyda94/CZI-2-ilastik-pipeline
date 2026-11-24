@@ -49,6 +49,12 @@ from .writers import (read_output_tile, h5_chunks, h5_filters, vigra_axistags, M
                       atomic_output, tiff_compressionargs, extra_tags)
 
 EXPORT_DONE_ATTR = "czipipe_export_complete"
+# Where ilastik is asked to put its export inside the HDF5 file. No leading slash: ilastik
+# joins this to the file name with a slash of its own, and splits "out.h5//exported_data"
+# by the rules for file paths. On Windows a doubled slash opens a network share, so
+# ilastik 1.4.2 there took the whole of "//exported_data" for the group and was left with
+# no dataset name: it made a *group* called exported_data and wrote no image at all.
+EXPORT_NAME = "exported_data"
 
 
 # ---------------------------------------------------------------- finding ilastik
@@ -201,7 +207,7 @@ def build_command(cfg, exe, ilp, raw_h5, internal, out_h5, axes):
         f"--export_dtype={ic.export_dtype}",
         "--output_format=hdf5",
         f"--output_filename_format={out_h5}",
-        "--output_internal_path=/exported_data",
+        f"--output_internal_path={EXPORT_NAME}",     # no leading slash: see EXPORT_NAME
         f"--output_axis_order={axes}",
         f"{raw_h5}/{internal.lstrip('/')}",          # positional input, must be last
     ]
@@ -415,6 +421,16 @@ class ExportMissing(RuntimeError):
     """ilastik reported success, but its output does not hold the export asked for."""
 
 
+def _export_dataset(f):
+    """The export in an open ilastik output file, or None if it holds no such image.
+
+    A group of that name is not one. It is what a run that wrote no image has left
+    behind (see EXPORT_NAME), and it has neither a shape nor pixels to read.
+    """
+    d = f[EXPORT_NAME] if EXPORT_NAME in f else None
+    return d if hasattr(d, "shape") else None
+
+
 def _check_export(out_h5, log_path, want=None, what="ilastik"):
     """Raise ExportMissing unless `out_h5` holds an export (of shape `want`, if given).
 
@@ -430,12 +446,15 @@ def _check_export(out_h5, log_path, want=None, what="ilastik"):
     else:
         try:
             with h5py.File(out_h5, "r") as f:
-                if "/exported_data" not in f:
-                    problem = f"{out_h5.name} holds no 'exported_data'"
-                elif want is not None and tuple(f["/exported_data"].shape) != tuple(want):
-                    problem = (f"the export in {out_h5.name} has shape "
-                               f"{tuple(f['/exported_data'].shape)}, not the expected "
-                               f"{tuple(want)}")
+                d = _export_dataset(f)
+                if d is None and EXPORT_NAME in f:
+                    problem = (f"'{EXPORT_NAME}' in {out_h5.name} is a group with no "
+                               "image in it")
+                elif d is None:
+                    problem = f"{out_h5.name} holds no '{EXPORT_NAME}'"
+                elif want is not None and tuple(d.shape) != tuple(want):
+                    problem = (f"the export in {out_h5.name} has shape {tuple(d.shape)}, "
+                               f"not the expected {tuple(want)}")
                 else:
                     return
         except Exception as exc:
@@ -478,9 +497,10 @@ def _export_is_complete(out_h5, key):
     try:
         with h5py.File(out_h5, "r") as f:
             # The marker alone is not proof. It was once written to a file ilastik had
-            # never touched, and such a file must be classified again, not reused.
+            # never touched, and once to one holding a group where the image should be;
+            # such a file must be classified again, not reused.
             return (_as_str(f.attrs.get(EXPORT_DONE_ATTR)) == key
-                    and "/exported_data" in f)
+                    and _export_dataset(f) is not None)
     except Exception:
         return False
 
@@ -637,9 +657,10 @@ def _chunk_resume_state(h5py, out_h5, want_hash, want_payload):
         return "new", 0, None
     try:
         with h5py.File(out_h5, "r") as f:
-            if "progress" not in f and "/exported_data" not in f:
+            if "progress" not in f and _export_dataset(f) is None:
                 # Nothing to continue and nothing to lose, e.g. the file an earlier
-                # version created to mark complete a run that had exported nothing.
+                # version marked complete after a run that had exported nothing, or
+                # only a group where the image should be.
                 return "new", 0, None
             prog = f["progress"]
             got = prog.attrs["fingerprint"]

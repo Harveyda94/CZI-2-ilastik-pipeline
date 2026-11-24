@@ -23,7 +23,7 @@ from czipipe.pipeline import Pipeline, _null_progress
 from czipipe.plan import ScenePlan
 from czipipe.writers import write_tiff
 
-from conftest import FakeH5, FakeSource
+from conftest import FakeH5, FakeSource, ilastik_export_target
 
 RECT = (0, 0, 150, 100)
 SEL_T, SEL_Z, SEL_C = [0], [0, 1], [0]
@@ -66,9 +66,13 @@ def job(cfg, tmp_path, monkeypatch):
         h5_path, internal = cmd[-1].rsplit(".h5/", 1)
         with FakeH5.File(h5_path + ".h5", "r") as fi:
             d = np.asarray(fi[internal][:])
+        group, name = ilastik_export_target(cmd)
         with FakeH5.File(out, "w") as fo:
-            fo.create_dataset("exported_data", shape=d.shape, dtype=np.uint8,
-                              chunks=None)[...] = (d >> 8).astype(np.uint8)
+            if name:
+                fo.create_dataset(name, shape=d.shape, dtype=np.uint8,
+                                  chunks=None)[...] = (d >> 8).astype(np.uint8)
+            else:           # ilastik makes the group, then has no name for the dataset
+                fo.create_group(group.strip("/"))
             fo.flush()
         runs.append(out)
         return True
@@ -269,9 +273,51 @@ def test_output_without_an_export_fails_and_is_classified_again(job, monkeypatch
     assert not any("reusing" in m and job.export.name in m for m in msgs)
 
 
+def test_export_path_names_a_dataset_to_ilastik_on_windows(cfg):
+    """'--output_internal_path=/exported_data' reached ilastik's writer as
+    '//exported_data', which Windows path rules read as a network share with no file
+    name. ilastik 1.4.2 made a group called exported_data and wrote no image."""
+    cmd = ilastik.build_command(cfg, "ilastik", "p.ilp", "raw.h5", "/data", "out.h5", "tzcyx")
+    assert ilastik_export_target(cmd) == ("/", "exported_data")
+    # The form that failed, so the line above cannot pass by the stand-in being lenient.
+    assert ilastik_export_target(["--output_internal_path=/exported_data"]) \
+        == ("//exported_data", "")
+
+
+def test_export_that_is_a_group_fails_and_is_classified_again(job, monkeypatch):
+    """What that ilastik left. The check passed it and it was marked complete; the
+    conversion, and every later run, stopped on "'Group' object has no attribute
+    'shape'"."""
+    real = ilastik.run_command
+
+    def wrote_a_group(cfg_, cmd, log_path, log=print):
+        out = [a.split("=", 1)[1] for a in cmd if a.startswith("--output_filename_format=")][0]
+        with FakeH5.File(out, "w") as fo:
+            fo.create_group("exported_data")
+            fo.flush()
+        return True
+
+    monkeypatch.setattr(ilastik, "run_command", wrote_a_group)
+    with pytest.raises(RuntimeError, match="is a group with no image in it"):
+        classify(job)
+    assert not job.seg.exists()
+
+    monkeypatch.setattr(ilastik, "run_command", real)
+    msgs = []
+    classify(job, log=msgs.append)
+    assert seg_is_correct(job) and len(job.runs) == 1
+    assert not any("reusing" in m and job.export.name in m for m in msgs)
+
+
 def test_completion_marker_on_a_file_with_no_export_is_not_trusted(job):
-    """What the earlier version left behind. It has to be classified again, not reused."""
+    """What the earlier versions left behind. It has to be classified again, not reused."""
     with FakeH5.File(job.export, "w") as f:
+        f.attrs[ilastik.EXPORT_DONE_ATTR] = "this job"
+        f.flush()
+    assert not ilastik._export_is_complete(job.export, "this job")
+
+    with FakeH5.File(job.export, "w") as f:
+        f.create_group("exported_data")
         f.attrs[ilastik.EXPORT_DONE_ATTR] = "this job"
         f.flush()
     assert not ilastik._export_is_complete(job.export, "this job")
